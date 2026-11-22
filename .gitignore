@@ -1,0 +1,4 @@
+webserver
+*.o
+tests/test_http
+*.dSYM/
