@@ -1,0 +1,2 @@
+# Linux/macOS 빌드용 소스이므로 체크아웃 시에도 항상 LF 유지 (Makefile 탭/CRLF 문제 방지)
+* text=auto eol=lf
