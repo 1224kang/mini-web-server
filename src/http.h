@@ -51,14 +51,21 @@ const char *http_get_header(const struct http_request *req, const char *name);
  * 숫자가 아니거나, 오버플로거나, 여러 번 나오면 -1 (→ 400). 정상이면 0. */
 int http_content_length(const struct http_request *req, size_t *out);
 
+/* 이 요청 뒤에도 연결을 유지하길 클라이언트가 원하는지 (1/0).
+ *   HTTP/1.1: 기본 유지. "Connection: close" 가 있으면 끊음.
+ *   HTTP/1.0: 기본 끊음. "Connection: keep-alive" 가 있으면 유지.
+ * 서버가 실제로 유지할지는 서버 사정(종료 중, 요청 수 한도 등)까지 보고 server.c 가 정한다. */
+int http_wants_keep_alive(const struct http_request *req);
+
 /* 상태 코드에 맞는 사유 문구. 예: 404 → "Not Found" */
 const char *http_reason(int status);
 
 /* 응답의 상태 라인 + 헤더 + 빈 줄을 out 에 쓴다. 본문은 호출한 쪽이 따로 보낸다.
  * extra_headers 는 NULL 이거나 "Name: value\r\n" 이 이어진 문자열.
+ * keep_alive 가 1 이면 "Connection: keep-alive", 0 이면 "Connection: close".
  * 쓴 바이트 수를 반환하고, out 이 모자라면 -1. */
 int http_build_response_head(char *out, size_t cap, int status,
                              const char *content_type, size_t body_len,
-                             const char *extra_headers);
+                             const char *extra_headers, int keep_alive);
 
 #endif
