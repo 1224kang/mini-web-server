@@ -1,8 +1,12 @@
 #include "server.h"
 #include "http.h"
+#include "static_files.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h> /* PATH_MAX */
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -203,23 +207,171 @@ static void close_gracefully(int fd)
 /* 연결 하나 처리                                                        */
 /* ------------------------------------------------------------------ */
 
-static void dispatch(int fd, const struct http_request *req,
+/* ------------------------------------------------------------------ */
+/* 정적 파일 서빙                                                        */
+/* ------------------------------------------------------------------ */
+
+#define FILE_CHUNK (64 * 1024) /* 큰 파일도 이만큼씩 읽어 보낸다 → 메모리 사용량이 파일 크기와 무관 */
+
+/* open/realpath 의 errno 를 상태 코드로 바꾼다. */
+static int status_from_errno(int err)
+{
+    switch (err) {
+    case ENOENT:
+    case ENOTDIR:      return 404; /* 없는 파일, 또는 "파일/xxx" 처럼 중간이 파일 */
+    case EACCES:
+    case EPERM:        return 403; /* 권한 없음 */
+    case ENAMETOOLONG: return 414;
+    default:           return 500; /* EMFILE(fd 고갈), EIO 등 서버 쪽 문제 */
+    }
+}
+
+/* fd 의 내용을 처음부터 끝까지 FILE_CHUNK 씩 읽어서 보낸다.
+ * 헤더는 이미 나갔으므로 여기서 실패하면 상태 코드를 바꿀 방법이 없다 → 연결을 끊을 뿐. */
+static int send_file_body(int sock, int file_fd, off_t size)
+{
+    static char chunk[FILE_CHUNK]; /* 단일 스레드라 static 버퍼로 충분 (4단계에서 다시 볼 것) */
+    off_t left = size;
+    while (left > 0) {
+        size_t want = left < (off_t)sizeof(chunk) ? (size_t)left : sizeof(chunk);
+        ssize_t r = read(file_fd, chunk, want);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("read");
+            return -1;
+        }
+        if (r == 0) { /* 보내는 도중 파일이 짧아졌다. Content-Length 를 못 채우니 끊는다. */
+            fprintf(stderr, "file shrank while sending\n");
+            return -1;
+        }
+        if (send_all(sock, chunk, (size_t)r) < 0) /* send 가 일부만 보내도 send_all 이 마저 보낸다 */
+            return -1;
+        left -= r;
+    }
+    return 0;
+}
+
+/* GET/HEAD 요청을 docroot 아래의 파일로 응답한다. */
+static void serve_file(int fd, const char *docroot, const struct http_request *req,
+                       int head_only)
+{
+    /* 1) 글자 수준 검사: URL → 파일 경로, ".." 탈출 차단 */
+    char path[STATIC_MAX_PATH];
+    int trailing_slash;
+    switch (static_resolve_path(docroot, req->target, path, sizeof(path), &trailing_slash)) {
+    case STATIC_OK:          break;
+    case STATIC_BAD_REQUEST: send_error(fd, 400, NULL); return;
+    case STATIC_FORBIDDEN:   send_error(fd, 403, NULL); return;
+    case STATIC_TOO_LONG:    send_error(fd, 414, NULL); return;
+    }
+
+    /* 2) 파일 시스템 수준 검사: 심볼릭 링크까지 다 풀어서 진짜 위치가 루트 안인지 */
+    char real[PATH_MAX];
+    if (!realpath(path, real)) {
+        send_error(fd, status_from_errno(errno), NULL);
+        return;
+    }
+    if (!static_is_under(docroot, real)) {
+        fprintf(stderr, "blocked: %s -> %s (outside docroot)\n", path, real);
+        send_error(fd, 403, NULL);
+        return;
+    }
+
+    /* 3) 열기. O_NONBLOCK: 혹시 FIFO(named pipe)라면 보통 open 은 상대가 나타날 때까지
+     *    영원히 멈춘다. 일반 파일 read 에는 영향이 없다. */
+    int file_fd = open(real, O_RDONLY | O_NONBLOCK);
+    if (file_fd < 0) {
+        send_error(fd, status_from_errno(errno), NULL);
+        return;
+    }
+    struct stat st;
+    if (fstat(file_fd, &st) < 0) {
+        perror("fstat");
+        close(file_fd);
+        send_error(fd, 500, NULL);
+        return;
+    }
+
+    /* 4) 디렉토리면 index.html 로 */
+    if (S_ISDIR(st.st_mode)) {
+        close(file_fd);
+        if (!trailing_slash) {
+            /* "/docs" → "/docs/" 로 보내야 index.html 안의 상대 경로(style.css)가
+             * "/docs/style.css" 로 제대로 풀린다. */
+            char loc[STATIC_MAX_PATH + 32];
+            size_t plen = strcspn(req->target, "?#");
+            int n = snprintf(loc, sizeof(loc), "Location: %.*s/\r\n", (int)plen, req->target);
+            if (n < 0 || (size_t)n >= sizeof(loc)) {
+                send_error(fd, 414, NULL);
+                return;
+            }
+            send_error(fd, 301, loc);
+            return;
+        }
+        if (strlen(real) + sizeof("/index.html") > sizeof(real)) {
+            send_error(fd, 414, NULL);
+            return;
+        }
+        strcat(real, "/index.html");
+        file_fd = open(real, O_RDONLY | O_NONBLOCK);
+        if (file_fd < 0) {
+            /* index.html 이 없는 디렉토리: 목록을 보여 주지 않는다(파일 이름 노출 방지). */
+            send_error(fd, errno == ENOENT ? 403 : status_from_errno(errno), NULL);
+            return;
+        }
+        if (fstat(file_fd, &st) < 0) {
+            perror("fstat");
+            close(file_fd);
+            send_error(fd, 500, NULL);
+            return;
+        }
+    }
+
+    /* 일반 파일만 보낸다. 장치 파일, 소켓, FIFO 등은 거절. */
+    if (!S_ISREG(st.st_mode)) {
+        close(file_fd);
+        send_error(fd, 403, NULL);
+        return;
+    }
+
+    /* 5) 헤더 먼저, 그다음 본문을 조각조각.
+     *    ※ 500 같은 에러는 반드시 이 줄 "전에" 판단해야 한다. 헤더가 나간 뒤엔 되돌릴 수 없다. */
+    const char *ctype = static_mime_type(real);
+    char head[1024];
+    int n = http_build_response_head(head, sizeof(head), 200, ctype,
+                                     (size_t)st.st_size, NULL);
+    if (n < 0 || send_all(fd, head, (size_t)n) < 0) {
+        close(file_fd);
+        return;
+    }
+    if (!head_only && send_file_body(fd, file_fd, st.st_size) < 0) {
+        close(file_fd);
+        return;
+    }
+    close(file_fd);
+    printf("<- 200 OK %s (%lld bytes%s)\n", real, (long long)st.st_size,
+           head_only ? ", HEAD" : "");
+}
+
+/* ------------------------------------------------------------------ */
+/* 연결 하나 처리                                                        */
+/* ------------------------------------------------------------------ */
+
+static void dispatch(int fd, const char *docroot, const struct http_request *req,
                      const char *body, size_t body_len)
 {
     if (strcmp(req->method, "GET") == 0) {
-        char msg[HTTP_MAX_HEAD + 128];
-        int n = snprintf(msg, sizeof(msg),
-                         "Hello from mini-web-server!\n"
-                         "You requested: %s %s\n",
-                         req->method, req->target);
-        if (n < 0 || (size_t)n >= sizeof(msg))
-            n = (int)strlen(msg);
-        send_response(fd, 200, "text/plain; charset=utf-8", msg, (size_t)n, NULL);
+        serve_file(fd, docroot, req, 0);
+        return;
+    }
+    if (strcmp(req->method, "HEAD") == 0) { /* GET 과 같은 헤더, 본문만 없음 */
+        serve_file(fd, docroot, req, 1);
         return;
     }
 
     if (strcmp(req->method, "POST") == 0) {
-        /* echo: 받은 본문을 받은 Content-Type 그대로 돌려준다. */
+        /* echo: 받은 본문을 받은 Content-Type 그대로 돌려준다. (2단계 확인용, 5단계에서 교체) */
         const char *ctype = http_get_header(req, "Content-Type");
         send_response(fd, 200, ctype ? ctype : "application/octet-stream",
                       body, body_len, NULL);
@@ -227,10 +379,10 @@ static void dispatch(int fd, const struct http_request *req,
     }
 
     /* 405 응답에는 허용 메서드를 알려 주는 Allow 헤더가 필수다. */
-    send_error(fd, 405, "Allow: GET, POST\r\n");
+    send_error(fd, 405, "Allow: GET, HEAD, POST\r\n");
 }
 
-void server_handle_client(int client_fd)
+void server_handle_client(int client_fd, const char *docroot)
 {
     /* 느린(혹은 악의적인) 클라이언트가 단일 스레드 서버를 영원히 붙잡지 못하게
      * recv 에 5초 제한을 건다. (제대로 된 타임아웃 설계는 4단계에서) */
@@ -288,7 +440,7 @@ void server_handle_client(int client_fd)
     }
 
     /* 4) 처리 + 응답 */
-    dispatch(client_fd, &req, body, clen);
+    dispatch(client_fd, docroot, &req, body, clen);
 
     free(body);
     close_gracefully(client_fd);

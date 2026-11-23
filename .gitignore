@@ -1,4 +1,5 @@
 webserver
 *.o
 tests/test_http
+tests/test_static
 *.dSYM/

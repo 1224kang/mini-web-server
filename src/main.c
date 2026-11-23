@@ -2,11 +2,14 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h> /* PATH_MAX */
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int parse_port(const char *s)
@@ -21,13 +24,27 @@ static int parse_port(const char *s)
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+    if (argc != 2 && argc != 3) {
+        fprintf(stderr, "usage: %s <port> [docroot=./www]\n", argv[0]);
         return 1;
     }
     int port = parse_port(argv[1]); //포트번호 검사
     if (port < 0) {
         fprintf(stderr, "invalid port: %s\n", argv[1]);
+        return 1;
+    }
+
+    /* 문서 루트를 "절대 경로 + 심볼릭 링크 해제" 형태로 한 번만 정규화해 둔다.
+     * 요청마다 realpath(요청 파일) 결과가 이 문자열로 시작하는지 비교해서 탈출을 막는다. */
+    static char docroot[PATH_MAX];
+    const char *root_arg = argc == 3 ? argv[2] : "www";
+    struct stat st;
+    if (!realpath(root_arg, docroot) || stat(docroot, &st) < 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "docroot is not a directory: %s\n", root_arg);
+        return 1;
+    }
+    if (strcmp(docroot, "/") == 0) {
+        fprintf(stderr, "refusing to serve the whole filesystem (docroot=/)\n");
         return 1;
     }
 
@@ -41,7 +58,7 @@ int main(int argc, char **argv)
     int listen_fd = server_listen(port);
     if (listen_fd < 0)
         return 1;
-    printf("listening on http://localhost:%d\n", port);
+    printf("listening on http://localhost:%d (docroot: %s)\n", port, docroot);
 
     /* 4) accept 루프: 연결이 올 때까지 여기서 멈춰(블로킹) 있다.
      * 한 번에 한 연결만 처리하므로, 처리 중엔 다음 손님이 큐에서 기다린다. */
@@ -60,7 +77,7 @@ int main(int argc, char **argv)
         inet_ntop(AF_INET, &client.sin_addr, ip, sizeof(ip));
         printf("accepted %s:%d\n", ip, ntohs(client.sin_port));
 
-        server_handle_client(client_fd);
+        server_handle_client(client_fd, docroot);
     }
 
     close(listen_fd); /* 도달하지 않음. 안전한 종료는 4단계에서 */

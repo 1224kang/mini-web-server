@@ -189,11 +189,13 @@ const char *http_reason(int status)
 {
     switch (status) {
     case 200: return "OK";
+    case 301: return "Moved Permanently";
     case 400: return "Bad Request";
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 413: return "Content Too Large";
+    case 414: return "URI Too Long";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     case 505: return "HTTP Version Not Supported";
