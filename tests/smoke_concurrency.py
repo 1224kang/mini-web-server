@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""4단계 스모크 테스트: 동시 접속, keep-alive, 타임아웃, 503, SIGPIPE, SIGINT 종료.
+
+실행: make smoke-concurrency
+(bash 3.2 로는 소켓 여러 개를 정확한 타이밍으로 붙잡고 있기 어려워서 파이썬으로 썼다.
+ idle/헤더 타임아웃(5초/10초)을 실제로 기다리므로 15초 정도 걸린다.)
+"""
+import concurrent.futures
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+BIN = os.path.join(REPO, "webserver")
+PORT = int(os.environ.get("PORT", "18199"))
+
+passed = failed = 0
+lock = threading.Lock()
+
+
+def check(name, ok, detail=""):
+    global passed, failed
+    with lock:
+        if ok:
+            passed += 1
+            print(f"PASS {name}")
+        else:
+            failed += 1
+            print(f"FAIL {name} {detail}")
+
+
+# ---------------------------------------------------------------- helpers
+
+def start_server(port, root, threads=None):
+    log = open(os.path.join(TMP, f"server-{port}.log"), "w")
+    args = [BIN, str(port), root] + ([str(threads)] if threads else [])
+    proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
+    for _ in range(50):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+            return proc
+        except OSError:
+            time.sleep(0.1)
+    raise RuntimeError("server did not start")
+
+
+def connect(port=PORT, timeout=15):
+    s = socket.create_connection(("127.0.0.1", port))
+    s.settimeout(timeout)
+    return s
+
+
+def read_response(s):
+    """응답 하나(헤더 + Content-Length 만큼의 본문)를 읽어
+    (status, headers, body, leftover) 반환. leftover 는 그 뒤에 딸려 온 바이트.
+    연결이 먼저 닫히면 None."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(65536)
+        if not chunk:
+            return None
+        buf += chunk
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    lines = head.decode().split("\r\n")
+    status = int(lines[0].split()[1])
+    headers = {}
+    for line in lines[1:]:
+        k, v = line.split(":", 1)
+        headers[k.strip().lower()] = v.strip()
+    n = int(headers.get("content-length", "0"))
+    while len(rest) < n:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        rest += chunk
+    return status, headers, rest[:n], rest[n:]
+
+
+def get(path="/", port=PORT, extra=""):
+    s = connect(port)
+    s.sendall(f"GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{extra}\r\n".encode())
+    r = read_response(s)
+    s.close()
+    return r
+
+
+def wait_closed(s):
+    """상대가 연결을 닫을 때까지 읽는다. 받은 바이트를 반환."""
+    data = b""
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                return data
+            data += chunk
+    except (ConnectionResetError, socket.timeout):
+        return data
+
+
+# ---------------------------------------------------------------- tests
+
+def test_many_concurrent():
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
+        results = list(ex.map(lambda _: get("/")[0], range(50)))
+    check("동시 요청 50개 모두 200", results.count(200) == 50, f"{results}")
+
+
+def test_slow_client_does_not_block():
+    slow = connect()
+    slow.sendall(b"GET / HTTP/1.1\r\n")  # 헤더를 보내다 만 손님이 워커 하나를 잡고 있음
+    time.sleep(0.2)
+    t0 = time.time()
+    r = get("/")
+    dt = time.time() - t0
+    check("느린 클라이언트가 있어도 다른 요청은 바로 처리", r[0] == 200 and dt < 1.0, f"{dt:.2f}s")
+    slow.close()
+
+
+def test_keep_alive():
+    s = connect()
+    s.sendall(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+    r1 = read_response(s)
+    check("HTTP/1.1 기본: Connection: keep-alive", r1[2] and r1[1].get("connection") == "keep-alive",
+          f"{r1[1]}")
+    s.sendall(b"GET /css/style.css HTTP/1.1\r\nHost: t\r\n\r\n")
+    r2 = read_response(s)
+    check("같은 연결로 두 번째 요청", r2 is not None and r2[0] == 200)
+    s.sendall(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+    r3 = read_response(s)
+    check("Connection: close 요청 → close 응답", r3[1].get("connection") == "close")
+    check("close 응답 뒤 서버가 연결을 닫음", wait_closed(s) == b"")
+    s.close()
+
+
+def test_http10():
+    s = connect()
+    s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+    r = read_response(s)
+    check("HTTP/1.0 기본: close", r[1].get("connection") == "close")
+    s.close()
+    s = connect()
+    s.sendall(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+    r = read_response(s)
+    check("HTTP/1.0 + keep-alive 요청 → keep-alive", r[1].get("connection") == "keep-alive")
+    s.close()
+
+
+def test_pipelining():
+    s = connect()
+    # 요청 두 개를 send 한 번에 붙여서 보낸다.
+    s.sendall(b"GET /css/style.css HTTP/1.1\r\nHost: t\r\n\r\n"
+              b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping")
+    r1 = read_response(s)
+    leftover = r1[3]
+    # 두 번째 응답이 이미 같이 왔을 수 있다
+    rest = leftover + wait_closed(s)
+    check("파이프라이닝: 첫 응답 200", r1[0] == 200)
+    check("파이프라이닝: 두 번째(POST echo) 응답", rest.startswith(b"HTTP/1.1 200") and rest.endswith(b"ping"),
+          repr(rest[:80]))
+    s.close()
+
+
+def test_idle_timeout():
+    s = connect()
+    t0 = time.time()
+    data = wait_closed(s)
+    dt = time.time() - t0
+    check("요청 없는 연결은 ~5초 뒤 닫힘 (idle timeout)", data == b"" and 4.5 <= dt <= 7, f"{dt:.2f}s")
+
+
+def test_header_timeout():
+    s = connect(timeout=20)
+    t0 = time.time()
+    # slowloris: 2초마다 한 바이트씩. recv 마다 타이머를 새로 걸면 영원히 안 끊긴다.
+    stop = threading.Event()
+
+    def drip():
+        for ch in b"GET / HTTP/1.1\r\nX-Slow: " + b"a" * 100:
+            if stop.is_set():
+                return
+            try:
+                s.send(bytes([ch]))
+            except OSError:
+                return
+            time.sleep(2 if ch == ord("a") else 0)
+
+    threading.Thread(target=drip, daemon=True).start()
+    data = wait_closed(s)
+    stop.set()
+    dt = time.time() - t0
+    check("slowloris: 헤더 마감(10초) 지나면 408", data.startswith(b"HTTP/1.1 408") and 9 <= dt <= 13,
+          f"{dt:.2f}s {data[:40]!r}")
+
+
+def test_sigpipe():
+    # 20MB 를 요청하고 조금만 읽은 뒤 끊는다 → 서버의 send 가 EPIPE/ECONNRESET
+    for _ in range(5):
+        s = connect()
+        s.sendall(b"GET /big.bin HTTP/1.1\r\nHost: t\r\n\r\n")
+        s.recv(1000)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+        s.close()  # SO_LINGER 0 → RST
+    time.sleep(0.3)
+    check("클라이언트가 중간에 끊어도 서버 생존 (SIGPIPE 무시)", SERVER.poll() is None and get("/")[0] == 200)
+
+
+def test_busy_503():
+    port = PORT + 1
+    proc = start_server(port, ROOT, threads=1)  # 워커 1, 큐 16
+    holders = [connect(port)]
+    time.sleep(0.3)                             # 워커가 첫 연결을 집어 가게
+    for _ in range(16):
+        holders.append(connect(port))           # 큐 16칸을 채움
+    time.sleep(0.3)
+    extra = connect(port, timeout=3)
+    data = wait_closed(extra)
+    check("큐가 꽉 차면 503 + Retry-After", data.startswith(b"HTTP/1.1 503") and b"Retry-After: 1" in data,
+          repr(data[:60]))
+    for h in holders:
+        h.close()
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=10)
+    check("SIGTERM 으로도 정상 종료 (exit 0)", proc.returncode == 0, f"rc={proc.returncode}")
+
+
+def test_graceful_shutdown():
+    port = PORT + 2
+    proc = start_server(port, ROOT)
+
+    idle = connect(port)                         # keep-alive 로 노는 연결
+    idle.sendall(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+    read_response(idle)
+
+    dl_path = os.path.join(TMP, "big.dl")       # 5초쯤 걸리는 다운로드
+    curl = subprocess.Popen(["curl", "-s", "--limit-rate", "4M", "-o", dl_path,
+                             f"http://127.0.0.1:{port}/big.bin"])
+    time.sleep(0.7)
+
+    t0 = time.time()
+    proc.send_signal(signal.SIGINT)
+    idle_data = wait_closed(idle)
+    check("SIGINT: 놀던 keep-alive 연결은 바로 닫힘", idle_data == b"" and time.time() - t0 < 1.5,
+          f"{time.time() - t0:.2f}s")
+    time.sleep(0.3)
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        refused = False
+    except OSError:
+        refused = True
+    check("SIGINT: 새 연결은 거절", refused)
+    check("SIGINT: 진행 중인 다운로드가 있으면 아직 안 끝남", proc.poll() is None)
+
+    curl.wait(timeout=30)
+    proc.wait(timeout=15)
+    same = open(dl_path, "rb").read() == open(os.path.join(ROOT, "big.bin"), "rb").read()
+    check("SIGINT: 진행 중이던 20MB 다운로드는 끝까지 완료", curl.returncode == 0 and same,
+          f"curl rc={curl.returncode}")
+    check("SIGINT: 워커 join 후 exit 0", proc.returncode == 0, f"rc={proc.returncode}")
+    log = open(os.path.join(TMP, f"server-{port}.log")).read()
+    check("SIGINT: 종료 로그(bye) 출력", "[main] bye" in log)
+
+
+def test_double_sigint():
+    port = PORT + 3
+    proc = start_server(port, ROOT)
+    curl = subprocess.Popen(["curl", "-s", "--limit-rate", "1M", "-o", "/dev/null",
+                             f"http://127.0.0.1:{port}/big.bin"])
+    time.sleep(0.5)
+    proc.send_signal(signal.SIGINT)
+    time.sleep(0.2)
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    check("Ctrl+C 두 번 → 즉시 강제 종료 (exit 130)", proc.returncode == 130, f"rc={proc.returncode}")
+    curl.kill()
+    curl.wait()
+
+
+# ---------------------------------------------------------------- main
+
+if __name__ == "__main__":
+    TMP = tempfile.mkdtemp()
+    ROOT = os.path.join(TMP, "root")
+    shutil.copytree(os.path.join(REPO, "www"), ROOT)
+    with open(os.path.join(ROOT, "big.bin"), "wb") as f:
+        f.write(os.urandom(20 * 1024 * 1024))
+
+    SERVER = start_server(PORT, ROOT)
+    try:
+        # 오래 걸리는 타임아웃 테스트는 백그라운드에서 같이 돌린다.
+        slow_tests = [threading.Thread(target=t) for t in (test_idle_timeout, test_header_timeout)]
+        for t in slow_tests:
+            t.start()
+
+        test_many_concurrent()
+        test_slow_client_does_not_block()
+        test_keep_alive()
+        test_http10()
+        test_pipelining()
+        test_sigpipe()
+        test_busy_503()
+        test_graceful_shutdown()
+        test_double_sigint()
+
+        for t in slow_tests:
+            t.join()
+    finally:
+        SERVER.send_signal(signal.SIGINT)
+        try:
+            SERVER.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            SERVER.kill()
+
+    print(f"\n{passed} passed, {failed} failed")
+    if failed:
+        print("--- server log ---")
+        print(open(os.path.join(TMP, f"server-{PORT}.log")).read()[-4000:])
+    shutil.rmtree(TMP, ignore_errors=True)
+    sys.exit(1 if failed else 0)

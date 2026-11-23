@@ -192,7 +192,7 @@ static void test_content_length_validation(void)
 static void test_response_head(void)
 {
     char out[256];
-    int n = http_build_response_head(out, sizeof(out), 404, "text/plain", 10, NULL);
+    int n = http_build_response_head(out, sizeof(out), 404, "text/plain", 10, NULL, 0);
     CHECK(n > 0);
     CHECK_STR(out,
               "HTTP/1.1 404 Not Found\r\n"
@@ -201,14 +201,50 @@ static void test_response_head(void)
               "Connection: close\r\n"
               "\r\n");
 
-    n = http_build_response_head(out, sizeof(out), 405, "text/plain", 0, "Allow: GET, POST\r\n");
+    n = http_build_response_head(out, sizeof(out), 405, "text/plain", 0, "Allow: GET, POST\r\n", 0);
     CHECK(n > 0 && strstr(out, "HTTP/1.1 405 Method Not Allowed\r\n") == out);
     CHECK(strstr(out, "Allow: GET, POST\r\n\r\n") != NULL);
 
     char tiny[16];
-    CHECK(http_build_response_head(tiny, sizeof(tiny), 200, "text/plain", 0, NULL) == -1);
+    CHECK(http_build_response_head(tiny, sizeof(tiny), 200, "text/plain", 0, NULL, 0) == -1);
+
+    n = http_build_response_head(out, sizeof(out), 200, "text/plain", 0, NULL, 1);
+    CHECK(n > 0 && strstr(out, "Connection: keep-alive\r\n") != NULL);
+    CHECK(strstr(out, "Connection: close") == NULL);
 
     CHECK_STR(http_reason(505), "HTTP Version Not Supported");
+}
+
+/* raw 요청을 파싱해서 http_wants_keep_alive 결과를 돌려준다. */
+static int wants_ka(const char *raw)
+{
+    struct http_request req;
+    char *owned;
+    int r = -1;
+    if (parse(raw, &req, &owned) == HTTP_PARSE_OK)
+        r = http_wants_keep_alive(&req);
+    free(owned);
+    return r;
+}
+
+static void test_keep_alive(void)
+{
+    /* 버전별 기본값 */
+    CHECK(wants_ka("GET / HTTP/1.1\r\nHost: a\r\n\r\n") == 1);
+    CHECK(wants_ka("GET / HTTP/1.0\r\n\r\n") == 0);
+    /* 명시적 지정, 대소문자 무시 */
+    CHECK(wants_ka("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n") == 0);
+    CHECK(wants_ka("GET / HTTP/1.1\r\nHost: a\r\nconnection: CLOSE\r\n\r\n") == 0);
+    CHECK(wants_ka("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n") == 1);
+    CHECK(wants_ka("GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n") == 1);
+    /* 쉼표 목록 */
+    CHECK(wants_ka("GET / HTTP/1.1\r\nHost: a\r\nConnection: Upgrade, close\r\n\r\n") == 0);
+    CHECK(wants_ka("GET / HTTP/1.0\r\nConnection: foo ,keep-alive\r\n\r\n") == 1);
+    /* 토큰 "일부"만 같은 건 아님 */
+    CHECK(wants_ka("GET / HTTP/1.1\r\nHost: a\r\nConnection: closed\r\n\r\n") == 1);
+    CHECK(wants_ka("GET / HTTP/1.0\r\nConnection: keep-alive-ish\r\n\r\n") == 0);
+    /* close 와 keep-alive 가 둘 다 있으면 close 가 이긴다 */
+    CHECK(wants_ka("GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n") == 0);
 }
 
 int main(void)
@@ -225,6 +261,7 @@ int main(void)
         { "too_many_headers",         test_too_many_headers },
         { "content_length_validation", test_content_length_validation },
         { "response_head",            test_response_head },
+        { "keep_alive",               test_keep_alive },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int before = g_failed;

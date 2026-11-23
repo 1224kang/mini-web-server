@@ -185,6 +185,41 @@ int http_content_length(const struct http_request *req, size_t *out)
     return 0;
 }
 
+/* "keep-alive, Upgrade" 처럼 쉼표로 나열된 토큰 중에 word 가 있는지 (대소문자 무시). */
+static int has_token(const char *list, const char *word)
+{
+    size_t wlen = strlen(word);
+    const char *p = list;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',')
+            p++;
+        const char *start = p;
+        while (*p && *p != ',')
+            p++;
+        const char *end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+            end--;
+        if ((size_t)(end - start) == wlen && strncasecmp(start, word, wlen) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+int http_wants_keep_alive(const struct http_request *req)
+{
+    /* 기본값: HTTP/1.1 은 "계속 쓴다", HTTP/1.0 은 "끊는다". */
+    int keep = strcmp(req->version, "HTTP/1.1") == 0;
+    for (size_t i = 0; i < req->header_count; i++) {
+        if (strcasecmp(req->headers[i].name, "Connection") != 0)
+            continue;
+        if (has_token(req->headers[i].value, "close"))
+            return 0; /* close 가 하나라도 있으면 무조건 끊는다 */
+        if (has_token(req->headers[i].value, "keep-alive"))
+            keep = 1;
+    }
+    return keep;
+}
+
 const char *http_reason(int status)
 {
     switch (status) {
@@ -194,10 +229,12 @@ const char *http_reason(int status)
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
     case 413: return "Content Too Large";
     case 414: return "URI Too Long";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
+    case 503: return "Service Unavailable";
     case 505: return "HTTP Version Not Supported";
     default:  return "Unknown";
     }
@@ -205,16 +242,17 @@ const char *http_reason(int status)
 
 int http_build_response_head(char *out, size_t cap, int status,
                              const char *content_type, size_t body_len,
-                             const char *extra_headers)
+                             const char *extra_headers, int keep_alive)
 {
     int n = snprintf(out, cap,
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: %s\r\n"
                      "Content-Length: %zu\r\n"
-                     "Connection: close\r\n"
+                     "Connection: %s\r\n"
                      "%s"
                      "\r\n",
                      status, http_reason(status), content_type, body_len,
+                     keep_alive ? "keep-alive" : "close",
                      extra_headers ? extra_headers : "");
     if (n < 0 || (size_t)n >= cap)
         return -1; /* 잘렸다 */
