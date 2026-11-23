@@ -42,7 +42,7 @@ enum static_resolve_result static_resolve_path(const char *docroot,
                                                char *out, size_t cap,
                                                int *trailing_slash)
 {
-    *trailing_slash = 0;
+    *trailing_slash = 0; // 원래 '/'로 끝났는지 기억해둬야 함. 
 
     /* "http://..." 같은 절대 URI 나 "*" 는 아직 다루지 않는다(6+단계 forward proxy). */
     if (target[0] != '/')
