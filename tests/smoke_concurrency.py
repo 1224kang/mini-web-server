@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """4단계 스모크 테스트: 동시 접속, keep-alive, 타임아웃, 503, SIGPIPE, SIGINT 종료.
+(서버 모델: 단일 스레드 poll 이벤트 루프)
 
 실행: make smoke-concurrency
 (bash 3.2 로는 소켓 여러 개를 정확한 타이밍으로 붙잡고 있기 어려워서 파이썬으로 썼다.
@@ -7,6 +8,8 @@
 """
 import concurrent.futures
 import os
+import re
+import resource
 import shutil
 import signal
 import socket
@@ -38,9 +41,9 @@ def check(name, ok, detail=""):
 
 # ---------------------------------------------------------------- helpers
 
-def start_server(port, root, threads=None):
+def start_server(port, root, max_conns=None):
     log = open(os.path.join(TMP, f"server-{port}.log"), "w")
-    args = [BIN, str(port), root] + ([str(threads)] if threads else [])
+    args = [BIN, str(port), root] + ([str(max_conns)] if max_conns else [])
     proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
     for _ in range(50):
         try:
@@ -167,6 +170,35 @@ def test_pipelining():
     s.close()
 
 
+def test_pipelining_many():
+    # 요청 5개를 send 한 번에. 첫 응답을 보낸 뒤엔 새 데이터가 안 오므로(POLLIN 없음)
+    # 서버가 버퍼에 남은 요청을 스스로 이어서 처리해야 한다.
+    s = connect()
+    reqs = b"".join(b"GET /css/style.css HTTP/1.1\r\nHost: t\r\n\r\n" for _ in range(4))
+    reqs += b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+    s.sendall(reqs)
+    data = wait_closed(s)
+    check("파이프라이닝: 요청 5개 → 응답 5개", data.count(b"HTTP/1.1 200 OK") == 5,
+          f"{data.count(b'HTTP/1.1 200 OK')}개")
+    s.close()
+
+
+def test_big_download_does_not_starve():
+    # 20MB 를 최대 속도로 받는 중에도 작은 요청이 바로 처리되는지.
+    # localhost 에선 송신 버퍼가 금방 차서 send 가 EAGAIN 으로 자연히 양보하므로,
+    # 이 테스트는 conn.c 의 WRITE_BUDGET 을 없애도 통과한다(직접 확인함).
+    # WRITE_BUDGET 은 송신 버퍼가 크고 클라이언트가 아주 빠른 환경을 위한 상한이다.
+    dl = subprocess.Popen(["curl", "-s", "-o", "/dev/null", f"http://127.0.0.1:{PORT}/big.bin"])
+    time.sleep(0.05)
+    worst = 0.0
+    for _ in range(10):
+        t0 = time.time()
+        get("/")
+        worst = max(worst, time.time() - t0)
+    dl.wait()
+    check("큰 다운로드 중에도 작은 요청 지연 < 0.5초", worst < 0.5, f"worst {worst:.3f}s")
+
+
 def test_idle_timeout():
     s = connect()
     t0 = time.time()
@@ -213,21 +245,45 @@ def test_sigpipe():
 
 def test_busy_503():
     port = PORT + 1
-    proc = start_server(port, ROOT, threads=1)  # 워커 1, 큐 16
-    holders = [connect(port)]
-    time.sleep(0.3)                             # 워커가 첫 연결을 집어 가게
-    for _ in range(16):
-        holders.append(connect(port))           # 큐 16칸을 채움
+    proc = start_server(port, ROOT, max_conns=16)  # 동시 연결 16개까지
+    time.sleep(0.2)                                 # start_server 의 접속 확인용 연결이 정리되게
+    holders = [connect(port) for _ in range(16)]    # 16개를 열어 둠 (아무것도 안 보냄)
     time.sleep(0.3)
     extra = connect(port, timeout=3)
     data = wait_closed(extra)
-    check("큐가 꽉 차면 503 + Retry-After", data.startswith(b"HTTP/1.1 503") and b"Retry-After: 1" in data,
+    check("연결 수 한도를 넘으면 503 + Retry-After", data.startswith(b"HTTP/1.1 503") and b"Retry-After: 1" in data,
           repr(data[:60]))
     for h in holders:
         h.close()
     proc.send_signal(signal.SIGTERM)
     proc.wait(timeout=10)
     check("SIGTERM 으로도 정상 종료 (exit 0)", proc.returncode == 0, f"rc={proc.returncode}")
+
+
+def test_many_idle_connections():
+    """C10K 맛보기: 노는 연결 1000개가 열려 있어도 새 요청이 바로 처리되는지.
+    스레드 풀(워커 8 + 큐 128)이었다면 136개째부터 503 이다."""
+    log = open(os.path.join(TMP, f"server-{PORT}.log")).read()
+    m = re.search(r"max (\d+) connections", log)
+    if not m or int(m.group(1)) < 1100:
+        print(f"SKIP 노는 연결 1000개 (서버 max_conns={m.group(1) if m else '?'}: fd 한도가 낮음)")
+        return
+    idle = []
+    try:
+        for _ in range(1000):
+            idle.append(connect())
+    except OSError as e:
+        check("노는 연결 1000개 열기", False, str(e))
+        for s in idle:
+            s.close()
+        return
+    time.sleep(0.3)
+    t0 = time.time()
+    r = get("/")
+    dt = time.time() - t0
+    check("노는 연결 1000개 + 새 요청 즉시 200", r is not None and r[0] == 200 and dt < 1.0, f"{dt:.2f}s")
+    for s in idle:
+        s.close()
 
 
 def test_graceful_shutdown():
@@ -262,9 +318,9 @@ def test_graceful_shutdown():
     same = open(dl_path, "rb").read() == open(os.path.join(ROOT, "big.bin"), "rb").read()
     check("SIGINT: 진행 중이던 20MB 다운로드는 끝까지 완료", curl.returncode == 0 and same,
           f"curl rc={curl.returncode}")
-    check("SIGINT: 워커 join 후 exit 0", proc.returncode == 0, f"rc={proc.returncode}")
+    check("SIGINT: 열린 연결이 모두 끝난 뒤 exit 0", proc.returncode == 0, f"rc={proc.returncode}")
     log = open(os.path.join(TMP, f"server-{port}.log")).read()
-    check("SIGINT: 종료 로그(bye) 출력", "[main] bye" in log)
+    check("SIGINT: 종료 로그(bye) 출력", "] bye (" in log)
 
 
 def test_double_sigint():
@@ -288,6 +344,11 @@ def test_double_sigint():
 # ---------------------------------------------------------------- main
 
 if __name__ == "__main__":
+    # 이 테스트 프로세스도 소켓 1000개를 열어야 하므로 fd 한도를 올린다.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = 4096 if hard == resource.RLIM_INFINITY else min(4096, hard)
+    if soft < want:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
     TMP = tempfile.mkdtemp()
     ROOT = os.path.join(TMP, "root")
     shutil.copytree(os.path.join(REPO, "www"), ROOT)
@@ -306,7 +367,10 @@ if __name__ == "__main__":
         test_keep_alive()
         test_http10()
         test_pipelining()
+        test_pipelining_many()
+        test_big_download_does_not_starve()
         test_sigpipe()
+        test_many_idle_connections()
         test_busy_503()
         test_graceful_shutdown()
         test_double_sigint()

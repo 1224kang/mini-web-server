@@ -1,34 +1,28 @@
 #include "server.h"
-#include "thread_pool.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h> /* PATH_MAX */
-#include <netinet/in.h>
-#include <poll.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define DEFAULT_THREADS  8
-#define QUEUE_PER_THREAD 16 /* 큐 크기 = 워커 수 × 이 값. 넘치면 503 */
+#define FD_LIMIT_WANT   10240 /* macOS 에서 setrlimit 으로 올릴 수 있는 기본 상한(OPEN_MAX) */
+#define FD_RESERVED     32    /* stdio, listen, 종료 파이프, 응답 중 여는 파일 등 */
+#define MAX_CONNS_LIMIT 10000
 
 /* ------------------------------------------------------------------ */
 /* 시그널 → 파이프 (self-pipe trick)                                    */
 /* ------------------------------------------------------------------ */
 
 /* 시그널 핸들러 안에서는 할 수 있는 일이 아주 적다(async-signal-safe 함수만).
- * printf, malloc, mutex 는 전부 금지. 그래서 "파이프에 1바이트 쓰기"만 한다.
- *
- * 이 파이프의 읽기 쪽(stop_pipe[0])은 아무도 비우지 않는다. 그래서 한 번 쓰이면
- * 영원히 "읽을 수 있음" 상태로 남는다 → poll 하는 모든 스레드(main, 워커 N개)가
- * 동시에, 놓치지 않고 종료를 알아챈다. */
+ * printf, malloc 은 전부 금지. 그래서 "파이프에 1바이트 쓰기"만 한다.
+ * 이벤트 루프는 이 파이프도 poll 목록에 넣어 두므로, 연결 이벤트와 똑같이
+ * "종료 이벤트"로 받아서 처리한다. 시그널이 일반 이벤트로 바뀌는 셈. */
 static int stop_pipe[2] = { -1, -1 };
 static volatile sig_atomic_t stop_count = 0;
 
@@ -59,46 +53,72 @@ static int setup_signals(void)
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_stop_signal;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0; /* SA_RESTART 없음: 막혀 있던 시스템 호출이 EINTR 로 깨어난다 */
+    sa.sa_flags = 0; /* SA_RESTART 없음: 잠들어 있던 poll 이 EINTR 로 깨어난다 */
     if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
         perror("sigaction");
         return -1;
     }
 
     /* 클라이언트가 먼저 끊은 소켓에 send 하면 SIGPIPE 로 서버가 "통째로" 죽는다.
-     * 무시하면 send 가 -1(EPIPE) 을 반환하므로 그 연결만 에러로 처리할 수 있다. */
+     * 무시하면 send 가 -1(EPIPE) 을 반환하므로 그 연결만 정리할 수 있다. */
     signal(SIGPIPE, SIG_IGN);
     return 0;
 }
 
+/* 연결 하나 = fd 하나. 프로세스가 열 수 있는 fd 수(macOS 터미널 기본 256)가 곧
+ * 동시 연결 수의 천장이다. C10K 를 하려면 이 한도부터 올려야 한다. */
+static long raise_fd_limit(void)
+{
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) < 0) //지금 한도 읽기
+        return 256;
+    rlim_t want = FD_LIMIT_WANT; //목표: 10240
+    if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max)
+        want = rl.rlim_max; //hard보다 높게는 못 올림 
+    if (rl.rlim_cur < want) { //지금이 목표보다 낮을 때만 
+        struct rlimit nl = { .rlim_cur = want, .rlim_max = rl.rlim_max };
+        if (setrlimit(RLIMIT_NOFILE, &nl) == 0) //soft만 올림(hard는 그대로)
+            rl = nl;
+    }
+    return (long)rl.rlim_cur; //최종 soft 값을 돌려줌 
+}
+
 /* ------------------------------------------------------------------ */
 
-static int parse_int(const char *s, long lo, long hi)
+static long parse_long(const char *s, long lo, long hi)
 {
     char *end;
     //문자열 -> 10진수
     long v = strtol(s, &end, 10);
     if (*s == '\0' || *end != '\0' || v < lo || v > hi)
         return -1;
-    return (int)v;
+    return v;
 }
 
 int main(int argc, char **argv)
 {
     if (argc < 2 || argc > 4) {
-        fprintf(stderr, "usage: %s <port> [docroot=./www] [threads=%d]\n", argv[0],
-                DEFAULT_THREADS);
+        fprintf(stderr, "usage: %s <port> [docroot=./www] [max_conns=auto]\n", argv[0]);
         return 1;
     }
-    int port = parse_int(argv[1], 1, 65535); //포트번호 검사
+    long port = parse_long(argv[1], 1, 65535); //포트번호 검사
     if (port < 0) {
         fprintf(stderr, "invalid port: %s\n", argv[1]);
         return 1;
     }
-    int nthreads = argc == 4 ? parse_int(argv[3], 1, 1024) : DEFAULT_THREADS;
-    if (nthreads < 0) {
-        fprintf(stderr, "invalid thread count (1..1024): %s\n", argv[3]);
-        return 1;
+
+    long fd_limit = raise_fd_limit();
+    long max_conns = fd_limit - FD_RESERVED;
+    if (max_conns > MAX_CONNS_LIMIT)
+        max_conns = MAX_CONNS_LIMIT;
+    if (argc == 4) {
+        long want = parse_long(argv[3], 1, max_conns);
+        if (want < 0) {
+            fprintf(stderr, "invalid max_conns (1..%ld with fd limit %ld): %s\n", max_conns,
+                    fd_limit, argv[3]);
+            return 1;
+        }
+        max_conns = want;
     }
 
     /* 문서 루트를 "절대 경로 + 심볼릭 링크 해제" 형태로 한 번만 정규화해 둔다.
@@ -121,97 +141,19 @@ int main(int argc, char **argv)
     if (setup_signals() < 0)
         return 1;
 
-    int listen_fd = server_listen(port);
+    int listen_fd = server_listen((int)port);
     if (listen_fd < 0)
         return 1;
-    /* poll 이 "연결 왔다"고 한 뒤 accept 전에 클라이언트가 RST 로 사라지면
-     * 블로킹 accept 는 다음 연결이 올 때까지 멈춘다 → non-blocking 으로 둔다. */
-    fcntl(listen_fd, F_SETFL, fcntl(listen_fd, F_GETFL) | O_NONBLOCK);
+    printf("listening on http://localhost:%ld (docroot: %s, event loop, max %ld connections, fd limit %ld)\n",
+           port, docroot, max_conns, fd_limit);
 
-    /* 워커 스레드가 SIGINT/SIGTERM 을 받지 않게 한다.
-     * 프로세스로 온 시그널은 "막지 않은 아무 스레드"에게 배달되는데, 워커가 받으면
-     * 워커의 recv/poll 이 엉뚱하게 EINTR 로 깨진다. 새 스레드는 만든 스레드의 마스크를
-     * 물려받으므로, 막은 상태로 풀을 만들고 main 에서만 다시 푼다. */
-    sigset_t stop_sigs, old_mask;
-    sigemptyset(&stop_sigs);
-    sigaddset(&stop_sigs, SIGINT);
-    sigaddset(&stop_sigs, SIGTERM);
-    pthread_sigmask(SIG_BLOCK, &stop_sigs, &old_mask);
+    /* 여기서 루프가 돈다. 종료 신호를 받고 열린 연결이 다 끝나면 돌아온다. */
+    struct server_stats s = { 0 };
+    int rc = server_run(listen_fd, stop_pipe[0], docroot, (int)max_conns, &s);
 
-    struct server_ctx ctx = { .docroot = docroot, .stop_fd = stop_pipe[0], .pool = NULL };
-    struct thread_pool *pool = pool_create(nthreads, (size_t)nthreads * QUEUE_PER_THREAD,
-                                           server_handle_client, &ctx);
-    /* pool 은 워커가 첫 연결을 받기 전(= pool_submit 의 mutex 이전)에 써 두므로 안전하다. */
-    ctx.pool = pool;
-    pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
-    if (!pool) {
-        fprintf(stderr, "failed to create thread pool\n");
-        close(listen_fd);
-        return 1;
-    }
-
-    printf("listening on http://localhost:%d (docroot: %s, %d workers, queue %d)\n",
-           port, docroot, nthreads, nthreads * QUEUE_PER_THREAD);
-
-    /* accept 루프: 이제 main 은 "접수 창구"만 한다. 연결을 받아 큐에 넣고 바로 다음 손님.
-     * listen 소켓과 종료 파이프를 같이 poll 해서, 둘 중 먼저 오는 쪽에 반응한다. */
-    for (;;) {
-        struct pollfd pfd[2] = {
-            { .fd = listen_fd, .events = POLLIN },
-            { .fd = stop_pipe[0], .events = POLLIN },
-        };
-        if (poll(pfd, 2, -1) < 0) {
-            if (errno == EINTR)
-                continue; /* 시그널로 깨어남 → 다시 poll 하면 파이프가 읽을 수 있음으로 보인다 */
-            perror("poll");
-            break;
-        }
-        if (pfd[1].revents)
-            break; /* 종료 신호 */
-        if (!(pfd[0].revents & POLLIN))
-            continue;
-
-        struct sockaddr_in client;
-        socklen_t clen = sizeof(client);
-        int client_fd = accept(listen_fd, (struct sockaddr *)&client, &clen);
-        if (client_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ECONNABORTED)
-                continue;
-            perror("accept");
-            if (errno == EMFILE || errno == ENFILE)
-                usleep(100 * 1000); /* fd 고갈: 바로 다시 돌면 CPU 100% 로 헛돈다 */
-            continue;
-        }
-        /* macOS(BSD)에서는 accept 한 소켓이 listen 소켓의 O_NONBLOCK 을 물려받는다(Linux 는 아님).
-         * 워커는 블로킹 소켓 + poll 마감 시간 방식으로 짜여 있으므로 꺼 준다. */
-        fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) & ~O_NONBLOCK);
-
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client.sin_addr, ip, sizeof(ip));
-
-        if (pool_submit(pool, client_fd) < 0) {
-            printf("[main] busy: rejecting %s:%d with 503\n", ip, ntohs(client.sin_port));
-            server_reject_busy(client_fd);
-            continue;
-        }
-        printf("[main] accepted %s:%d (queued: %zu)\n", ip, ntohs(client.sin_port),
-               pool_pending(pool));
-    }
-
-    /* ---- 우아한 종료(graceful shutdown) ----
-     * 1) 새 연결 그만 받기: listen 소켓을 닫으면 이후 접속은 커널이 거절(RST)한다.
-     * 2) 큐에서 기다리던 연결은 닫고, 요청을 처리하던 워커는 그 응답을 끝까지 보낸 뒤
-     *    (Connection: close) 나온다. keep-alive 로 놀던 워커는 종료 파이프를 보고 바로 나온다.
-     * 3) 모든 워커를 join 한 뒤에야 공유 자원(통계, docroot 등)을 정리한다. */
-    printf("\n[main] shutting down: no new connections, waiting for workers...\n");
-    close(listen_fd);
-    pool_destroy(pool);
-
-    struct server_stats s;
-    server_stats_get(&s);
-    printf("[main] bye (connections: %lu, requests: %lu, still active: %lu)\n",
-           s.connections, s.requests, s.active);
+    printf("[loop] bye (connections: %lu, requests: %lu, rejected: %lu)\n", s.connections,
+           s.requests, s.rejected);
     close(stop_pipe[0]);
     close(stop_pipe[1]);
-    return 0;
+    return rc == 0 ? 0 : 1;
 }
