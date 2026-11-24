@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mini-web-server</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="icon" href="/images/logo.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <img src="/images/logo.svg" alt="" width="64" height="64">
+    <h1>mini-web-server</h1>
+    <p>C + POSIX 소켓만으로 만든 웹 서버입니다. (Phase 2: HTTP 파서 + 정적 파일 서빙)</p>
+    <ul>
+      <li><a href="/docs/">/docs/</a> — 하위 디렉토리의 index.html</li>
+      <li><a href="/docs">/docs</a> — 슬래시 없는 디렉토리 요청 (301 리다이렉트)</li>
+      <li><a href="/data.json">/data.json</a> — application/json</li>
+      <li><a href="/nope.html">/nope.html</a> — 404 Not Found</li>
+    </ul>
+    <p id="js-status">JavaScript 로딩 전</p>
+  </main>
+  <script src="/js/app.js"></script>
+</body>
+</html>

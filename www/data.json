@@ -1,0 +1,5 @@
+{
+  "server": "mini-web-server",
+  "phase": 2,
+  "features": ["http-parser", "static-files", "mime-types", "path-traversal-guard"]
+}
