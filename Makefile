@@ -1,14 +1,24 @@
 CC      := cc
 CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -g -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
-TARGET  := webserver
+MODE    ?= release
 PORT    ?= 18080
 SRCS    := src/main.c src/server.c src/http.c src/static_files.c src/conn.c \
            src/config.c src/cgi.c src/upstream.c src/builtin.c
-OBJS    := $(SRCS:.c=.o)
+OBJ_DIR := build/$(MODE)
+OBJS    := $(SRCS:src/%.c=$(OBJ_DIR)/%.o)
 
-TEST_BIN := tests/test_http tests/test_static tests/test_dynamic
+ifeq ($(MODE),asan)
+CFLAGS   += -fsanitize=address -fno-omit-frame-pointer
+TARGET   := webserver_asan
+TEST_DIR := $(OBJ_DIR)
+else
+TARGET   := webserver
+TEST_DIR := tests
+endif
 
-.PHONY: all clean run run-proxy backends asan test smoke smoke-concurrency smoke-dynamic
+TEST_BIN := $(addprefix $(TEST_DIR)/,test_http test_static test_dynamic)
+
+.PHONY: all clean run run-proxy backends asan test test-asan smoke smoke-concurrency smoke-dynamic
 
 all: $(TARGET)
 
@@ -17,23 +27,26 @@ $(TARGET): $(OBJS)
 
 HDRS    := $(wildcard src/*.h)
 
-src/%.o: src/%.c $(HDRS)
+$(OBJ_DIR)/%.o: src/%.c $(HDRS) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# 파서 단위 테스트: 소켓 없이 src/http.c 만 링크한다.
+$(OBJ_DIR):
+	mkdir -p $@
+
+# 각 빌드 모드의 단위 테스트 실행 파일을 사용한다.
 test: $(TEST_BIN)
-	./tests/test_http
-	./tests/test_static
-	./tests/test_dynamic
+	./$(TEST_DIR)/test_http
+	./$(TEST_DIR)/test_static
+	./$(TEST_DIR)/test_dynamic
 
-tests/test_http: tests/test_http.c src/http.c src/http.h
-	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_http.c src/http.c
+$(TEST_DIR)/test_http: tests/test_http.c src/http.c src/http.h | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -Isrc -o $@ $(filter %.c,$^)
 
-tests/test_static: tests/test_static.c src/static_files.c src/static_files.h
-	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_static.c src/static_files.c
+$(TEST_DIR)/test_static: tests/test_static.c src/static_files.c src/static_files.h | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -Isrc -o $@ $(filter %.c,$^)
 
-tests/test_dynamic: tests/test_dynamic.c src/upstream.c src/builtin.c src/config.c src/http.c $(HDRS)
-	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_dynamic.c src/upstream.c src/builtin.c src/config.c src/http.c
+$(TEST_DIR)/test_dynamic: tests/test_dynamic.c src/upstream.c src/builtin.c src/config.c src/http.c $(HDRS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -Isrc -o $@ $(filter %.c,$^)
 
 # 실제 서버를 띄워 curl 로 정적 파일 서빙을 확인한다.
 smoke: $(TARGET)
@@ -60,9 +73,12 @@ backends:
 	python3 tests/backend.py 8001 & python3 tests/backend.py 8002 & python3 tests/backend.py 8003 & \
 	wait
 
-# 메모리 오류 검사용 빌드 (7단계에서 본격적으로 사용)
-asan: CFLAGS += -fsanitize=address -fno-omit-frame-pointer
-asan: clean $(TARGET)
+asan:
+	$(MAKE) MODE=asan all
+
+test-asan:
+	$(MAKE) MODE=asan test
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(TEST_BIN)
+	rm -f $(SRCS:.c=.o) webserver webserver_asan tests/test_http tests/test_static tests/test_dynamic
+	rm -rf build/release build/asan

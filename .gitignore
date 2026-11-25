@@ -1,4 +1,6 @@
 webserver
+webserver_asan
+/build/
 *.o
 tests/test_http
 tests/test_static
