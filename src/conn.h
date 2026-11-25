@@ -64,6 +64,15 @@ void conn_shutdown(struct conn *c, long long now);
 /* fd 를 닫고 메모리를 푼다. */
 void conn_free(struct conn *c);
 
+/* 이 연결이 poll 에 내놓았던 fd(클라이언트 소켓, CGI 파이프, 백엔드 소켓)를 close 하기 "직전"에
+ * fn(ctx, fd) 를 부른다. 이벤트 루프는 여기서 그 fd 의 감시 등록을 지운다.
+ *
+ * 왜 필요한가: epoll/kqueue 는 등록을 커널이 들고 있다. 루프 모르게 fd 를 닫고 같은 번호로
+ * 새 fd 를 열면(예: 프록시 재시도), 루프는 "번호가 같으니 그대로"라고 보고 새 fd 를 등록하지 않는다.
+ * 닫기 직전에 알려 주면 루프가 등록을 먼저 지우고, 다음에 새 fd 를 다시 등록한다. */
+typedef void (*conn_close_hook)(void *ctx, int fd);
+void conn_set_close_hook(struct conn *c, conn_close_hook fn, void *ctx);
+
 /* 지금까지 파싱에 성공한 요청 수 (통계용). */
 unsigned long conn_total_requests(void);
 

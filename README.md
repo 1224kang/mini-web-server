@@ -42,6 +42,20 @@ poll(listen, stop)                        poll([wake, stop, 자식회수, 자기
 - fd를 만든 뒤 `FD_CLOEXEC`를 켜기 전에 다른 스레드가 CGI를 `fork`하면 그 fd가 자식에게 샙니다. `accept`, 백엔드 `socket`, CGI의 `pipe`+`fork`는 같은 잠금(`cgi_fd_guard`) 안에서 합니다.
 - 동시 연결 한도(`max_conns`)는 모든 루프를 합친 값입니다. 스레드 수는 설정 파일의 `workers`로 정하며, 생략하면 CPU 코어 수(최대 8)입니다.
 
+### 이벤트 백엔드 (poller)
+
+루프는 `poll`을 직접 부르지 않고 `event.h`의 poller에 fd를 **등록**해 둡니다. epoll/kqueue로 바꿀 수 있게 하는 첫 단계이며, 지금 백엔드는 `poll` 하나(`event_poll.c`)입니다. 시작 로그에 `poll backend`로 표시됩니다.
+
+| 함수 | 하는 일 |
+|---|---|
+| `poller_add` / `poller_mod` / `poller_del` | fd를 감시 목록에 넣기 / 기다리는 이벤트 바꾸기 / 빼기 |
+| `poller_wait` | 준비된 fd와 등록할 때 넘긴 `ptr`을 돌려줌 (level-triggered) |
+
+- 연결이 기다리는 fd가 바뀔 수 있는 때는 그 연결을 건드린 직후뿐입니다(`conn_new`, `conn_handle`, `conn_timeout`, `conn_shutdown`). 루프는 그때만 `watch_sync`로 `conn_pollfds` 결과와 등록을 비교해 바뀐 것만 알립니다.
+- 이벤트의 `ptr`이 연결(`struct watch`)을 가리키므로, 이벤트가 온 연결을 배열을 훑지 않고 바로 찾습니다.
+- `conn.c`는 감시 중인 fd를 닫기 직전에 훅(`conn_set_close_hook`)을 부릅니다. epoll/kqueue는 등록을 커널이 들고 있어서, 루프 모르게 fd를 닫고 같은 번호로 새 fd를 열면(예: 프록시 재시도) 새 fd가 등록되지 않습니다. 훅에서 등록을 먼저 지워 이 문제를 막습니다.
+- 아직 남은 O(연결 수) 작업: `poll` 자체, 가장 가까운 마감 찾기, 마감 지난 연결 찾기, 끝난 연결 정리. 다음 단계에서 epoll/kqueue 백엔드와 타이머 힙으로 바꿉니다.
+
 ## 서버 구성
 
 ```mermaid
@@ -59,7 +73,7 @@ flowchart LR
     N <-->|"HTTP/1.1"| A["라운드 로빈 백엔드"]
 ```
 
-1. `main.c`가 포트·문서 루트와 설정을 읽고 리스닝 소켓을 엽니다. `server.c`의 acceptor가 연결을 받아 이벤트 루프 스레드에 넘기고, 각 루프는 자기 연결의 fd, 종료 신호, CGI 자식 종료를 `poll`로 감시합니다.
+1. `main.c`가 포트·문서 루트와 설정을 읽고 리스닝 소켓을 엽니다. `server.c`의 acceptor가 연결을 받아 이벤트 루프 스레드에 넘기고, 각 루프는 자기 연결의 fd, 종료 신호, CGI 자식 종료를 poller(`event.h`, 지금은 `poll` 백엔드)로 감시합니다.
 2. `http.c`가 요청 헤더를 파싱하고, `conn.c`가 필요한 본문을 읽습니다. 요청을 받은 뒤 **프록시 규칙 → `/cgi-bin/` → `/builtin/` → 정적 파일** 순서로 처리합니다.
 3. 정적 파일은 작은 조각으로 읽어 보냅니다. CGI는 자식의 stdin과 stdout을 동시에 감시하고, 출력으로 HTTP 응답을 구성한 뒤 자식을 회수합니다.
 4. 프록시는 가장 긴 경로 접두사의 백엔드 중 하나를 라운드 로빈으로 선택합니다. 연결에 실패한 백엔드는 잠시 건너뛰고 다른 백엔드로 재시도합니다([백엔드 장애 조치](#백엔드-장애-조치)). 백엔드에는 요청마다 HTTP/1.1 연결을 사용하며, 응답 헤더를 확인한 뒤 본문을 스트리밍합니다. 클라이언트 쪽은 응답 경계가 명확하면 keep-alive를 유지할 수 있습니다.

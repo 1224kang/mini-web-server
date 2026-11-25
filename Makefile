@@ -7,7 +7,7 @@ endif
 MODE    ?= release
 PORT    ?= 18080
 SRCS    := src/main.c src/server.c src/http.c src/static_files.c src/conn.c \
-           src/config.c src/cgi.c src/upstream.c src/builtin.c
+           src/config.c src/cgi.c src/upstream.c src/builtin.c src/event_poll.c
 OBJ_DIR := build/$(MODE)
 OBJS    := $(SRCS:src/%.c=$(OBJ_DIR)/%.o)
 

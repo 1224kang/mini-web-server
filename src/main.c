@@ -1,5 +1,6 @@
 #include "cgi.h"
 #include "config.h"
+#include "event.h"
 #include "server.h"
 
 #include <errno.h>
@@ -178,8 +179,8 @@ int main(int argc, char **argv)
     int listen_fd = server_listen((int)port);
     if (listen_fd < 0)
         return 1;
-    printf("listening on http://localhost:%ld (docroot: %s, %d event loop%s, max %ld connections, fd limit %ld)\n",
-           port, docroot, workers, workers == 1 ? "" : "s", max_conns, fd_limit);
+    printf("listening on http://localhost:%ld (docroot: %s, %d event loop%s, %s backend, max %ld connections, fd limit %ld)\n",
+           port, docroot, workers, workers == 1 ? "" : "s", poller_backend(), max_conns, fd_limit);
     if (cfg.cgi_dir[0])
         printf("  cgi:   /cgi-bin/* -> %s (timeout %d ms)\n", cfg.cgi_dir, cfg.cgi_timeout_ms);
     for (int i = 0; i < cfg.nroutes; i++) {

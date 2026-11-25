@@ -112,6 +112,10 @@ struct conn {
     char *up_buf;           /* CGI 출력 */
     size_t up_len, up_cap;
     char up_name[PATH_MAX]; /* 로그용: 스크립트 경로 또는 백엔드 주소 */
+
+    /* poll 에 내놓은 fd 를 닫기 직전에 부른다 (이벤트 루프가 감시 등록을 지우도록) */
+    conn_close_hook close_hook;
+    void *close_ctx;
 };
 
 /* 모든 이벤트 루프 스레드가 함께 센다 → atomic */
@@ -146,6 +150,21 @@ static int would_block(void)
     return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 }
 
+/* conn_pollfds 로 내놓는 fd(클라이언트, CGI 파이프, 백엔드 소켓)는 반드시 이걸로 닫는다.
+ * 루프에 먼저 알린 뒤 닫는다 → 루프가 감시 등록을 지울 수 있다. */
+static void close_watched(struct conn *c, int fd)
+{
+    if (c->close_hook)
+        c->close_hook(c->close_ctx, fd);
+    close(fd);
+}
+
+void conn_set_close_hook(struct conn *c, conn_close_hook fn, void *ctx)
+{
+    c->close_hook = fn;
+    c->close_ctx = ctx;
+}
+
 /* ------------------------------------------------------------------ */
 /* 상태 전환                                                            */
 /* ------------------------------------------------------------------ */
@@ -154,9 +173,9 @@ static int would_block(void)
 static void release_upstream(struct conn *c)
 {
     if (c->up_in_fd >= 0)
-        close(c->up_in_fd);
+        close_watched(c, c->up_in_fd);
     if (c->up_out_fd >= 0)
-        close(c->up_out_fd);
+        close_watched(c, c->up_out_fd);
     c->up_in_fd = c->up_out_fd = -1;
     if (c->cgi_pid > 0)
         cgi_release(c->cgi_pid, 1);
@@ -596,7 +615,7 @@ static void upstream_write(struct conn *c, long long now)
             c->deadline = now + c->cfg->proxy_timeout_ms;
     }
     if (c->up_kind == UP_CGI) {
-        close(c->up_in_fd);
+        close_watched(c, c->up_in_fd);
         c->up_in_fd = -1;
     } else {
         free(c->up_req);
@@ -786,7 +805,7 @@ static void proxy_connect_failed(struct conn *c, const char *why, int timed_out,
 
     if (count_bits(c->px_tried) < c->px_route->nbackends) {
         conn_log(c, "proxy %s: %s, marked down for %d ms, retrying next backend", b->name, why, fail_ms);
-        close(c->up_out_fd);
+        close_watched(c, c->up_out_fd);
         c->up_out_fd = -1;
         free(c->up_req);
         c->up_req = NULL;
@@ -823,7 +842,7 @@ static int proxy_has_output(const struct conn *c)
 
 static void proxy_finish_input(struct conn *c)
 {
-    close(c->up_out_fd);
+    close_watched(c, c->up_out_fd);
     c->up_out_fd = -1;
 }
 
@@ -1477,6 +1496,6 @@ void conn_shutdown(struct conn *c, long long now)
 void conn_free(struct conn *c)
 {
     release_response(c);
-    close(c->fd);
+    close_watched(c, c->fd);
     free(c);
 }
