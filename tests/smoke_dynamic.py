@@ -494,9 +494,31 @@ def test_proxy(backends):
           all(st == 200 and json.loads(b)["body"] == f"n={i}" for i, (st, _, b, _) in enumerate(posts)),
           [p[0] for p in posts])
 
-    # 응답 단계의 실패(느린 백엔드)는 요청을 이미 보냈으므로 재시도하지 않고 504
-    st, _, _, dt = request("GET", "/api/slow?ms=3000")
-    check("느린 백엔드(3초) → proxy_timeout(1초) 후 504", st == 504 and 0.8 < dt < 2.0, f"{st} {dt:.2f}s")
+    # 응답 단계의 실패: 연결은 되는데 응답이 없다(멈춘 백엔드). 지금 살아 있는 건 b0, b2 (b1 은 죽음)
+    # GET 은 다시 보내도 안전 → 다른 백엔드로 재시도해 200, 멈춘 백엔드는 down → 이후 요청은 건너뜀
+    stopped = f"b{BACKEND_PORTS[0]}"
+    backends[0].send_signal(signal.SIGSTOP)
+    try:
+        gets = [request("GET", f"/api/stall/{i}") for i in range(3)]
+        check("멈춘 백엔드에 걸린 GET → proxy_timeout(1초) 뒤 다른 백엔드로 재시도해 200",
+              all(st == 200 and json.loads(b)["backend"] != stopped for st, _, b, _ in gets)
+              and any(0.8 < dt < 2.0 for *_, dt in gets),
+              [(g[0], round(g[3], 2)) for g in gets])
+        check("응답 시간 초과 로그: down 표시 후 재시도",
+              f"127.0.0.1:{BACKEND_PORTS[0]}: response timed out, marked down for {FAIL_MS} ms, "
+              "retrying next backend" in server_log(), "")
+        later = [request("GET", f"/api/stall/later{i}") for i in range(3)]
+        check("응답 없던 백엔드는 down 동안 기다리지 않고 건너뜀",
+              all(st == 200 and dt < 0.3 for st, _, _, dt in later),
+              [(g[0], round(g[3], 2)) for g in later])
+    finally:
+        backends[0].send_signal(signal.SIGCONT)
+
+    # POST 는 백엔드가 이미 처리했을 수 있으므로(중복 주문) 응답 시간 초과에도 재시도하지 않고 504
+    st, _, _, dt = request("POST", "/api/slow?ms=3000", b"order=1")
+    check("느린 백엔드(3초)의 POST → 재시도 없이 proxy_timeout(1초) 후 504",
+          st == 504 and 0.8 < dt < 2.0, f"{st} {dt:.2f}s")
+    check("POST 는 재시도하지 않는다는 로그", "not retrying (method not safe to retry)" in server_log(), "")
 
     st, _, _, _ = request("GET", "/index.html")
     check("프록시 실패 뒤에도 정적 파일 정상", st == 200)

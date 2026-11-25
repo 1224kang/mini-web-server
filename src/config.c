@@ -19,6 +19,7 @@ void config_defaults(struct server_config *cfg)
     cfg->proxy_connect_timeout_ms = 1000;
     cfg->proxy_timeout_ms = 5000;
     cfg->proxy_fail_timeout_ms = 10000;
+    cfg->proxy_retry_timeout_ms = 5000;
 
     struct stat st;
     if (stat("cgi-bin", &st) == 0 && S_ISDIR(st.st_mode) && !realpath("cgi-bin", cfg->cgi_dir))
@@ -116,6 +117,8 @@ int config_load(struct server_config *cfg, const char *path)
             rc = parse_ms(val, &cfg->proxy_timeout_ms);
         } else if (strcmp(key, "proxy_fail_timeout_ms") == 0) {
             rc = parse_ms(val, &cfg->proxy_fail_timeout_ms);
+        } else if (strcmp(key, "proxy_retry_timeout_ms") == 0) {
+            rc = parse_ms(val, &cfg->proxy_retry_timeout_ms);
         } else if (strcmp(key, "proxy") == 0) {
             if (cfg->nroutes == CONFIG_MAX_ROUTES || !val || val[0] != '/' ||
                 strlen(val) >= CONFIG_MAX_PREFIX) {
