@@ -87,8 +87,9 @@ def main():
         v = ymax * i / 4
         y = py(v)
         o.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + pw}" y2="{y:.1f}" stroke="{GRID}" stroke-width="1"/>')
-        o.append(f'<text x="{left - 10}" y="{y + 4:.1f}" font-size="12" fill="{INK2}" text-anchor="end">'
-                 f'{v / 1000:g}k</text>' if v else f'{v:g}</text>')
+        label = f'{v / 1000:g}k' if v else '0'
+        o.append(f'<text x="{left - 10}" y="{y + 4:.1f}" font-size="12" fill="{INK2}" '
+                 f'text-anchor="end">{label}</text>')
     o.append(f'<text x="22" y="{top + ph / 2:.1f}" font-size="12" fill="{INK2}" text-anchor="middle" '
              f'transform="rotate(-90 22 {top + ph / 2:.1f})">초당 처리 요청 수 (req/s)</text>')
     for x in xs:
