@@ -203,6 +203,33 @@ def test_builtin():
 
 # ---------------------------------------------------------------- 6단계: 프록시
 
+def test_proxy_stream():
+    size = 20 * 1024 * 1024
+    with socket.create_connection(("127.0.0.1", PORT), timeout=10) as s:
+        start = time.monotonic()
+        s.sendall(b"GET /api/stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        with s.makefile("rb") as stream:
+            head = b""
+            while (line := stream.readline()) not in (b"\r\n", b""):
+                head += line
+            first = stream.read(4096)
+            check("프록시 본문이 백엔드 전송 완료 전에 도착", first == b"x" * 4096
+                  and time.monotonic() - start < 0.70)
+            time.sleep(0.9)  # 읽지 않는 동안 프록시의 클라이언트 소켓 송신 버퍼가 찬다.
+            st, _, _, elapsed = request("GET", "/index.html")
+            check("프록시 클라이언트가 읽지 않아도 정적 요청 처리", st == 200 and elapsed < 0.5)
+            status, headers, _ = parse(head + b"\r\n")
+            total, valid = len(first), True
+            while data := stream.read(65536):
+                total += len(data)
+                valid = valid and data == b"x" * len(data)
+            check("20 MiB 프록시 응답의 길이와 내용 유지", status == 200 and valid
+                  and int(headers["content-length"]) == total == size)
+    st, h, b, _ = request("GET", "/api/truncated", headers={"Connection": "keep-alive"})
+    check("본문 중간에 끊긴 프록시 응답은 연결 종료",
+          st == 200 and h.get("content-length") == "10" and b == b"abc")
+
+
 def test_proxy(backends):
     seq = []
     for _ in range(6):
@@ -210,6 +237,7 @@ def test_proxy(backends):
         seq.append(json.loads(b)["backend"] if st == 200 else st)
     names = [f"b{p}" for p in BACKEND_PORTS]
     check("Round-Robin: 3개에 번갈아 분배", seq == names * 2, seq)
+    test_proxy_stream()
 
     st, h, b, _ = request("GET", "/api/hdr?x=1", headers={"X-Forwarded-For": "1.2.3.4", "X-Hop": "1",
                                                            "Connection": "close, X-Hop"})

@@ -1,6 +1,7 @@
 #include "upstream.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -193,13 +194,17 @@ int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind
 
         if (name_is(line, nlen, "Content-Length")) {
             long cl = 0;
+            while (vlen > 0 && (v[vlen - 1] == ' ' || v[vlen - 1] == '\t'))
+                vlen--;
             if (vlen == 0)
                 return -1;
             for (size_t i = 0; i < vlen; i++) {
-                if (!isdigit((unsigned char)v[i]) || cl > 100000000L)
+                if (!isdigit((unsigned char)v[i]) || cl > (LONG_MAX - (v[i] - '0')) / 10)
                     return -1;
                 cl = cl * 10 + (v[i] - '0');
             }
+            if (kind == UPSTREAM_HTTP && out->content_length >= 0 && out->content_length != cl)
+                return -1;
             out->content_length = cl;
         } else if (kind == UPSTREAM_CGI && name_is(line, nlen, "Status")) {
             if (parse_status(v, vlen, &out->status, out->reason, sizeof(out->reason)) < 0)
@@ -228,13 +233,9 @@ int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind
     return 0;
 }
 
-static int status_has_no_body(int status)
-{
-    return status == 204 || status == 304;
-}
-
-char *upstream_build_client_response(const struct upstream_response *r, int head_only,
-                                     int keep_alive, const char *via, size_t *out_len)
+static char *build_client_response(const struct upstream_response *r, const char *version,
+                                   long content_length, int include_body, int keep_alive,
+                                   const char *via, size_t *out_len)
 {
     /* 업스트림 응답의 Connection 헤더 값 (거기 적힌 헤더도 빼야 한다) */
     const char *conn_v = "";
@@ -252,7 +253,7 @@ char *upstream_build_client_response(const struct upstream_response *r, int head
     }
 
     struct sb s = { 0 };
-    sb_printf(&s, "HTTP/1.1 %d %s\r\n", r->status, r->reason);
+    sb_printf(&s, "%s %d %s\r\n", version, r->status, r->reason);
     for (const char *line = r->head; line < end;) {
         const char *nl = memchr(line, '\n', (size_t)(end - line));
         const char *le = nl ? nl : end;
@@ -271,19 +272,31 @@ char *upstream_build_client_response(const struct upstream_response *r, int head
         line = nl ? nl + 1 : end;
     }
 
-    int no_body = status_has_no_body(r->status);
-    if (!no_body) {
-        /* HEAD 에 대한 백엔드 응답은 본문 없이 Content-Length 만 온다 → 그 값을 그대로 */
-        size_t cl = head_only && r->content_length >= 0 ? (size_t)r->content_length : r->body_len;
-        sb_printf(&s, "Content-Length: %zu\r\n", cl);
-    }
+    if (r->status != 204 && content_length >= 0)
+        sb_printf(&s, "Content-Length: %ld\r\n", content_length);
     sb_printf(&s, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
     if (via)
         sb_printf(&s, "Via: %s\r\n", via);
     sb_mem(&s, "\r\n", 2);
-    if (!head_only && !no_body)
+    if (include_body && r->body_len > 0)
         sb_mem(&s, r->body, r->body_len);
     return sb_finish(&s, out_len);
+}
+
+char *upstream_build_client_response(const struct upstream_response *r, int head_only,
+                                     int keep_alive, const char *via, size_t *out_len)
+{
+    int no_body = r->status == 204 || r->status == 304;
+    long length = head_only && r->content_length >= 0 ? r->content_length : (long)r->body_len;
+    return build_client_response(r, "HTTP/1.1", no_body ? -1 : length,
+                                 !head_only && !no_body, keep_alive, via, out_len);
+}
+
+char *upstream_build_proxy_head(const struct upstream_response *r, const char *version,
+                                int keep_alive, size_t *out_len)
+{
+    return build_client_response(r, version, r->content_length, 0, keep_alive,
+                                 "1.1 mini-web-server", out_len);
 }
 
 /* ------------------------------------------------------------------ */

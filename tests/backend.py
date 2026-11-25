@@ -24,6 +24,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _reply(self):
         url = urlsplit(self.path)
+        if url.path == "/api/stream":
+            size = 20 * 1024 * 1024
+            self.send_response(200)
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            self.wfile.write(b"x" * 4096)
+            time.sleep(0.75)
+            for _ in range((size - 4096) // 65536):
+                self.wfile.write(b"x" * 65536)
+            self.wfile.write(b"x" * ((size - 4096) % 65536))
+            return
+        if url.path == "/api/truncated":
+            self.send_response(200)
+            self.send_header("Content-Length", "10")
+            self.end_headers()
+            self.wfile.write(b"abc")
+            return
         if url.path.endswith("/slow"):
             ms = int(parse_qs(url.query).get("ms", ["3000"])[0])
             time.sleep(ms / 1000)

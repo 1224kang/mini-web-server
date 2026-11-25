@@ -46,6 +46,10 @@ int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind
 char *upstream_build_client_response(const struct upstream_response *r, int head_only,
                                      int keep_alive, const char *via, size_t *out_len);
 
+/* 프록시 중계용 헤더. 본문은 호출자가 조각 단위로 전송한다. */
+char *upstream_build_proxy_head(const struct upstream_response *r, const char *version,
+                                int keep_alive, size_t *out_len);
+
 /* 프록시: 클라이언트 요청을 백엔드에게 보낼 요청으로 다시 쓴다 (malloc, 실패하면 NULL).
  *
  *   - 백엔드와는 HTTP/1.0 + "Connection: close": 응답 끝 = 연결 끝이라 읽기가 단순해지고,

@@ -25,7 +25,9 @@
 #define LINGER_TIMEOUT_MS 1000  /* 닫기 전 남은 입력을 비우는 최대 시간 */
 #define LINGER_MAX_BYTES  (64 * 1024)
 /* CGI/백엔드 타임아웃은 설정 파일에서 (config.h) */
-#define UPSTREAM_MAX_RESPONSE (16 * 1024 * 1024) /* 업스트림 응답을 통째로 모아 둘 최대 크기 */
+#define UPSTREAM_MAX_RESPONSE (16 * 1024 * 1024) /* CGI 출력 최대 크기 */
+#define PROXY_HEADER_LIMIT (16 * 1024)
+#define PROXY_BUFFER_SIZE  (64 * 1024)
 #define MAX_REQUESTS_PER_CONN 100
 
 #define FILE_CHUNK   (64 * 1024)  /* 파일을 이만큼씩 읽어 보낸다 */
@@ -47,11 +49,8 @@ enum conn_state {
  * "어디까지 했는지"를 전부 여기 적어 둬야 한다. 이게 상태 머신이다. */
 enum up_kind { UP_NONE, UP_CGI, UP_PROXY };
 
-/* 프록시는 ST_UPSTREAM 안에서 다시 세 단계를 차례로 거친다. 단계마다 기다리는 신호가 다르다.
- *   PX_CONNECTING : non-blocking connect 결과를 기다림   (POLLOUT → SO_ERROR 확인)
- *   PX_SENDING    : 다시 쓴 요청을 백엔드에 보내는 중      (POLLOUT)
- *   PX_RECEIVING  : 백엔드 응답을 EOF 까지 모으는 중       (POLLIN) */
-enum proxy_step { PX_NONE, PX_CONNECTING, PX_SENDING, PX_RECEIVING };
+/* 프록시 연결, 요청 전송, 응답 헤더 수신, 본문 중계 순서. */
+enum proxy_step { PX_NONE, PX_CONNECTING, PX_SENDING, PX_READING_HEAD, PX_RELAYING };
 
 struct conn {
     int fd;
@@ -93,10 +92,11 @@ struct conn {
     pid_t cgi_pid;          /* 아직 cgi_release 하지 않은 자식 (0 이면 없음) */
     int up_in_fd, up_out_fd;
     enum proxy_step px_step; /* 프록시: 지금 몇 번째 단계인지 (CGI 는 PX_NONE) */
+    long proxy_remaining;   /* 남은 백엔드 본문 바이트. -1이면 EOF까지 받는다 */
     const char *up_send;    /* 업스트림에 보낼 것 (CGI: 요청 본문, 프록시: 다시 쓴 요청) */
     size_t up_send_len, up_send_sent;
     char *up_req;           /* 프록시: 다시 쓴 요청 (up_send 가 가리킴, 우리가 해제) */
-    char *up_buf;           /* 업스트림이 보낸 것 전부 */
+    char *up_buf;           /* CGI 출력 */
     size_t up_len, up_cap;
     char up_name[PATH_MAX]; /* 로그용: 스크립트 경로 또는 백엔드 주소 */
 };
@@ -477,37 +477,34 @@ static const char *up_label(const struct conn *c)
  *   504 Gateway Timeout: 업스트림이 "제때" 답을 안 했다 */
 static void upstream_fail(struct conn *c, int status, const char *why, long long now)
 {
+    if (c->up_kind == UP_PROXY && c->out_sent > 0) {
+        conn_log(c, "proxy %s: %s after response started", c->up_name, why);
+        release_response(c);
+        start_linger(c, now);
+        return;
+    }
     conn_log(c, "%s %s: %s -> %d", up_label(c), c->up_name, why, status);
-    release_upstream(c); /* CGI 가 아직 돌고 있으면 여기서 SIGKILL */
+    release_response(c); /* CGI 가 아직 돌고 있으면 여기서 SIGKILL */
     send_error(c, status, NULL, now);
 }
 
-/* 업스트림이 출력을 다 보냈다(EOF). 해석해서 클라이언트에게 보낼 응답으로 바꾼다.
- * 업스트림 응답을 통째로 모은 뒤 바꾸므로, 우리가 Content-Length 를 정확히 알고
- * 클라이언트와의 keep-alive 를 그대로 유지할 수 있다. (대신 응답 크기에 상한이 있다) */
-static void upstream_complete(struct conn *c, long long now)
+/* CGI 출력을 모아 Content-Length를 계산한 뒤 응답을 만든다. */
+static void cgi_complete(struct conn *c, long long now)
 {
-    if (c->up_kind == UP_CGI && c->cgi_pid > 0) {
+    if (c->cgi_pid > 0) {
         /* stdout 이 닫혔다 = 자식이 끝났거나 곧 끝난다. 이미 끝났으면 바로 거두고,
          * 아니면 고아 목록에 넣어 SIGCHLD 때 거둔다. (죽이지는 않는다) */
         cgi_release(c->cgi_pid, 0);
         c->cgi_pid = 0;
     }
     struct upstream_response r;
-    enum upstream_kind kind = c->up_kind == UP_CGI ? UPSTREAM_CGI : UPSTREAM_HTTP;
-    if (upstream_parse_response(c->up_buf ? c->up_buf : "", c->up_len, kind, &r) < 0) {
+    if (upstream_parse_response(c->up_buf ? c->up_buf : "", c->up_len, UPSTREAM_CGI, &r) < 0) {
         upstream_fail(c, 502, c->up_len == 0 ? "empty response" : "malformed response", now);
-        return;
-    }
-    if (kind == UPSTREAM_HTTP && !c->head_only && r.content_length >= 0 &&
-        r.body_len < (size_t)r.content_length) {
-        upstream_fail(c, 502, "response truncated", now); /* 백엔드가 보내다 죽었다 */
         return;
     }
     size_t out_len;
     char *out = upstream_build_client_response(&r, c->head_only, c->keep_alive && !c->stopping,
-                                               kind == UPSTREAM_HTTP ? "1.1 mini-web-server" : NULL,
-                                               &out_len);
+                                               NULL, &out_len);
     if (!out) {
         upstream_fail(c, 500, "cannot build response", now);
         return;
@@ -523,7 +520,7 @@ static void upstream_complete(struct conn *c, long long now)
 }
 
 /* 업스트림 출력을 "한 번" 읽는다. 더 있으면 poll 이 또 알려 준다. */
-static void upstream_read(struct conn *c, long long now)
+static void cgi_read(struct conn *c, long long now)
 {
     if (c->up_len == c->up_cap) {
         if (c->up_cap >= UPSTREAM_MAX_RESPONSE) {
@@ -546,13 +543,11 @@ static void upstream_read(struct conn *c, long long now)
         upstream_fail(c, 502, strerror(errno), now);
         return;
     }
-    if (n == 0) { /* EOF: CGI 가 stdout 을 닫음 / 백엔드가 연결을 닫음 = 응답 끝 */
-        upstream_complete(c, now);
+    if (n == 0) {
+        cgi_complete(c, now);
         return;
     }
     c->up_len += (size_t)n;
-    if (c->up_kind == UP_PROXY) /* 백엔드: "조용한 시간"이 proxy_timeout 을 넘으면 504 */
-        c->deadline = now + c->cfg->proxy_timeout_ms;
 }
 
 /* up_send 를 보낼 수 있는 만큼 보낸다. CGI 는 다 보내면 stdin 을 닫아 "본문 끝(EOF)"을 알린다. */
@@ -574,12 +569,18 @@ static void upstream_write(struct conn *c, long long now)
             return;
         }
         c->up_send_sent += (size_t)n;
+        if (c->up_kind == UP_PROXY)
+            c->deadline = now + c->cfg->proxy_timeout_ms;
     }
     if (c->up_kind == UP_CGI) {
         close(c->up_in_fd);
         c->up_in_fd = -1;
     } else {
-        c->px_step = PX_RECEIVING; /* 이제 conn_pollfds 가 POLLOUT 대신 POLLIN 을 건다 */
+        free(c->up_req);
+        c->up_req = NULL;
+        c->up_send = NULL;
+        c->px_step = PX_READING_HEAD;
+        c->deadline = now + c->cfg->proxy_timeout_ms;
     }
 }
 
@@ -744,15 +745,142 @@ static void proxy_check_connect(struct conn *c, long long now)
     upstream_write(c, now);
 }
 
+static int proxy_has_output(const struct conn *c)
+{
+    return c->out_sent < c->out_len || c->chunk_sent < c->chunk_len;
+}
+
+static void proxy_finish_input(struct conn *c)
+{
+    close(c->up_out_fd);
+    c->up_out_fd = -1;
+}
+
+/* 출력 대기 중에는 백엔드를 poll에서 뺀다. 연결 하나가 본문 조각 하나만 보유한다. */
+static void proxy_flush(struct conn *c, long long now)
+{
+    const char *buf;
+    size_t len, *sent;
+    if (c->out_sent < c->out_len) {
+        buf = c->out;
+        len = c->out_len;
+        sent = &c->out_sent;
+    } else {
+        buf = c->chunk;
+        len = c->chunk_len;
+        sent = &c->chunk_sent;
+    }
+    ssize_t n = send(c->fd, buf + *sent, len - *sent, 0);
+    if (n < 0) {
+        if (!would_block())
+            close_now(c);
+        return;
+    }
+    *sent += (size_t)n;
+    if (proxy_has_output(c))
+        c->deadline = now + SEND_TIMEOUT_MS;
+    else if (c->up_out_fd < 0)
+        finish_response(c, now);
+    else {
+        c->chunk_len = c->chunk_sent = 0;
+        c->deadline = now + c->cfg->proxy_timeout_ms;
+    }
+}
+
+static void proxy_queue_body(struct conn *c, size_t len)
+{
+    if (c->proxy_remaining >= 0) {
+        if (len > (size_t)c->proxy_remaining)
+            len = (size_t)c->proxy_remaining;
+        c->proxy_remaining -= (long)len;
+        if (c->proxy_remaining == 0)
+            proxy_finish_input(c);
+    }
+    c->chunk_len = len;
+    c->chunk_sent = 0;
+}
+
+static void proxy_read_head(struct conn *c, long long now)
+{
+    if (!c->chunk && !(c->chunk = malloc(PROXY_BUFFER_SIZE))) {
+        upstream_fail(c, 500, "out of memory", now);
+        return;
+    }
+    size_t previous = c->up_len;
+    ssize_t n = read(c->up_out_fd, c->chunk + previous, PROXY_HEADER_LIMIT - previous);
+    if (n <= 0) {
+        if (n == 0 || !would_block())
+            upstream_fail(c, 502, "incomplete response header", now);
+        return;
+    }
+    c->up_len += (size_t)n;
+    c->deadline = now + c->cfg->proxy_timeout_ms;
+    size_t start = previous > 3 ? previous - 3 : 0;
+    long end = http_find_head_end(c->chunk + start, c->up_len - start);
+    if (end < 0) {
+        if (c->up_len == PROXY_HEADER_LIMIT)
+            upstream_fail(c, 502, "response header too large", now);
+        return;
+    }
+
+    size_t head_len = start + (size_t)end;
+    struct upstream_response r;
+    if (upstream_parse_response(c->chunk, head_len, UPSTREAM_HTTP, &r) < 0) {
+        upstream_fail(c, 502, "malformed response header", now);
+        return;
+    }
+    int no_body = c->head_only || r.status == 204 || r.status == 304;
+    c->proxy_remaining = no_body ? 0 : r.content_length;
+    if (c->proxy_remaining < 0)
+        c->keep_alive = 0; /* 길이 없는 본문은 클라이언트에게도 EOF로 끝을 알린다. */
+    c->out = upstream_build_proxy_head(&r, c->req.version, c->keep_alive && !c->stopping,
+                                      &c->out_len);
+    if (!c->out) {
+        upstream_fail(c, 500, "cannot build response header", now);
+        return;
+    }
+    snprintf(c->summary, sizeof(c->summary), "<- %d %s from proxy %s",
+             r.status, r.reason, c->up_name);
+    c->px_step = PX_RELAYING;
+    size_t received = c->up_len - head_len;
+    memmove(c->chunk, c->chunk + head_len, received);
+    proxy_queue_body(c, received);
+    c->deadline = now + SEND_TIMEOUT_MS;
+}
+
+static void proxy_read_body(struct conn *c, long long now)
+{
+    size_t limit = PROXY_BUFFER_SIZE;
+    if (c->proxy_remaining >= 0 && (size_t)c->proxy_remaining < limit)
+        limit = (size_t)c->proxy_remaining;
+    ssize_t n = read(c->up_out_fd, c->chunk, limit);
+    if (n < 0) {
+        if (!would_block())
+            upstream_fail(c, 502, strerror(errno), now);
+    } else if (n == 0) {
+        if (c->proxy_remaining >= 0)
+            upstream_fail(c, 502, "response truncated", now);
+        else
+            finish_response(c, now);
+    } else {
+        proxy_queue_body(c, (size_t)n);
+        c->deadline = now + SEND_TIMEOUT_MS;
+    }
+}
+
 /* 백엔드 소켓에 신호가 왔다. 지금 단계가 할 일 하나만 한다. */
 static void proxy_io(struct conn *c, short revents, long long now)
 {
     switch (c->px_step) {
     case PX_CONNECTING: proxy_check_connect(c, now); break; /* 다 되면 → PX_SENDING */
-    case PX_SENDING:    upstream_write(c, now);      break; /* 다 보내면 → PX_RECEIVING */
-    case PX_RECEIVING:                                      /* EOF 면 → upstream_complete */
+    case PX_SENDING: upstream_write(c, now); break;
+    case PX_READING_HEAD:
         if (revents & (POLLIN | POLLHUP | POLLERR))
-            upstream_read(c, now);
+            proxy_read_head(c, now);
+        break;
+    case PX_RELAYING:
+        if (revents & (POLLIN | POLLHUP | POLLERR))
+            proxy_read_body(c, now);
         break;
     case PX_NONE:       break;
     }
@@ -909,7 +1037,7 @@ static void on_read_body(struct conn *c, short revents, long long now)
         dispatch(c, now); /* → 프록시 / CGI 면 ST_UPSTREAM, 나머지는 ST_WRITE */
 }
 
-/* ST_UPSTREAM: 클라이언트 소켓은 기다리지 않고, CGI 파이프나 백엔드 소켓의 신호를 처리한다. */
+/* ST_UPSTREAM: CGI 파이프 또는 프록시의 소켓 이벤트를 처리한다. */
 static void on_upstream(struct conn *c, const struct pollfd *pfds, int n, long long now)
 {
     if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -917,6 +1045,10 @@ static void on_upstream(struct conn *c, const struct pollfd *pfds, int n, long l
         conn_log(c, "client went away while waiting for %s", up_label(c));
         release_upstream(c);
         close_now(c);
+        return;
+    }
+    if (c->up_kind == UP_PROXY && (pfds[0].revents & POLLOUT)) {
+        proxy_flush(c, now);
         return;
     }
     for (int i = 1; i < n && c->state == ST_UPSTREAM; i++) {
@@ -927,7 +1059,7 @@ static void on_upstream(struct conn *c, const struct pollfd *pfds, int n, long l
         else if (pfds[i].fd == c->up_out_fd && c->up_kind == UP_PROXY)
             proxy_io(c, pfds[i].revents, now);      /* 백엔드 소켓: 단계별로 */
         else if (pfds[i].fd == c->up_out_fd)
-            upstream_read(c, now);                  /* CGI stdout: 출력 모으기 */
+            cgi_read(c, now);                       /* CGI stdout: 출력 모으기 */
     }
 }
 
@@ -991,7 +1123,8 @@ static short conn_events(const struct conn *c)
     case ST_READ_BODY:
     case ST_LINGER: return POLLIN;
     case ST_WRITE:  return POLLOUT;
-    default:        return 0; /* UPSTREAM: 클라이언트 쪽은 기다릴 게 없다 */
+    case ST_UPSTREAM: return c->up_kind == UP_PROXY && proxy_has_output(c) ? POLLOUT : 0;
+    default:        return 0;
     }
 }
 
@@ -1005,8 +1138,8 @@ int conn_pollfds(const struct conn *c, struct pollfd *out)
          * 서로를 영원히 기다린다(교착). */
         if (c->up_in_fd >= 0)
             out[n++] = (struct pollfd){ .fd = c->up_in_fd, .events = POLLOUT };
-        if (c->up_out_fd >= 0) {
-            short ev = POLLIN; /* CGI stdout, 또는 프록시 PX_RECEIVING */
+        if (c->up_out_fd >= 0 && (c->up_kind == UP_CGI || !proxy_has_output(c))) {
+            short ev = POLLIN;
             if (c->px_step == PX_CONNECTING || c->px_step == PX_SENDING)
                 ev = POLLOUT; /* 연결 완료 / 요청 보내기를 기다리는 중 */
             out[n++] = (struct pollfd){ .fd = c->up_out_fd, .events = ev };
@@ -1063,7 +1196,10 @@ void conn_timeout(struct conn *c, long long now)
     case ST_UPSTREAM:
         if (c->up_kind == UP_CGI)
             upstream_fail(c, 504, "timed out, killing", now);
-        else
+        else if (proxy_has_output(c)) {
+            conn_log(c, "proxy send timed out (client not reading)");
+            close_now(c);
+        } else
             upstream_fail(c, 504, c->px_step == PX_CONNECTING ? "connect timed out" : "response timed out", now);
         break;
     case ST_WRITE:
