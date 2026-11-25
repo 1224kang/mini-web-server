@@ -2,12 +2,15 @@
 #define CONFIG_H
 
 /*
- * 서버 설정. 포트/docroot/max_conns 는 명령줄로, 나머지(CGI, 프록시)는 설정 파일로 받는다.
+ * 서버 설정. 포트/docroot/max_conns 는 명령줄로, 타임아웃과 라우팅은 설정 파일로 받는다.
  *
  * 설정 파일 형식 (한 줄에 하나, '#' 뒤는 주석):
  *
  *   cgi_dir                  cgi-bin
  *   cgi_timeout_ms           5000
+ *   keepalive_timeout_ms     5000
+ *   header_timeout_ms       10000
+ *   body_timeout_ms         30000
  *   proxy_connect_timeout_ms 1000
  *   proxy_timeout_ms         5000
  *   proxy  /api/  127.0.0.1:8001 127.0.0.1:8002 127.0.0.1:8003
@@ -38,6 +41,9 @@ struct proxy_route {
 struct server_config {
     int port;
     const char *docroot;          /* realpath 로 정규화된 절대 경로 */
+    int keepalive_timeout_ms;    /* 요청 첫 바이트까지 기다리는 시간 */
+    int header_timeout_ms;       /* 첫 바이트부터 헤더 전체까지의 마감 */
+    int body_timeout_ms;         /* 헤더 파싱 후 본문 전체까지의 마감 */
     char cgi_dir[PATH_MAX];       /* realpath 로 정규화. 빈 문자열이면 CGI 끔 */
     int cgi_timeout_ms;
     int proxy_connect_timeout_ms;

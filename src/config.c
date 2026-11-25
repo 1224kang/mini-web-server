@@ -11,6 +11,9 @@
 void config_defaults(struct server_config *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
+    cfg->keepalive_timeout_ms = 5000;
+    cfg->header_timeout_ms = 10000;
+    cfg->body_timeout_ms = 30000;
     cfg->cgi_timeout_ms = 5000;
     cfg->proxy_connect_timeout_ms = 1000;
     cfg->proxy_timeout_ms = 5000;
@@ -84,6 +87,12 @@ int config_load(struct server_config *cfg, const char *path)
                 fprintf(stderr, "%s:%d: cgi_dir not found: %s\n", path, lineno, val ? val : "");
                 rc = -1;
             }
+        } else if (strcmp(key, "keepalive_timeout_ms") == 0) {
+            rc = parse_ms(val, &cfg->keepalive_timeout_ms);
+        } else if (strcmp(key, "header_timeout_ms") == 0) {
+            rc = parse_ms(val, &cfg->header_timeout_ms);
+        } else if (strcmp(key, "body_timeout_ms") == 0) {
+            rc = parse_ms(val, &cfg->body_timeout_ms);
         } else if (strcmp(key, "cgi_timeout_ms") == 0) {
             rc = parse_ms(val, &cfg->cgi_timeout_ms);
         } else if (strcmp(key, "proxy_connect_timeout_ms") == 0) {

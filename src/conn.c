@@ -21,9 +21,6 @@
 #include <unistd.h>
 
 /* 시간 제한: "이 연결이 서버 자원을 얼마나 오래 붙잡을 수 있나"의 상한 */
-#define IDLE_TIMEOUT_MS   5000  /* keep-alive: 다음 요청의 첫 바이트를 기다리는 최대 시간 */
-#define HEADER_TIMEOUT_MS 10000 /* 첫 바이트부터 "\r\n\r\n" 까지 (slowloris 방어) */
-#define BODY_TIMEOUT_MS   30000 /* 본문 전체를 받는 최대 시간 */
 #define SEND_TIMEOUT_MS   10000 /* 한 바이트도 못 보내고 버틸 수 있는 시간 (안 읽는 클라이언트) */
 #define LINGER_TIMEOUT_MS 1000  /* 닫기 전 남은 입력을 비우는 최대 시간 */
 #define LINGER_MAX_BYTES  (64 * 1024)
@@ -207,7 +204,7 @@ static void enter_read_head(struct conn *c, long long now)
 {
     c->scanned = 0;
     c->head_only = 0;
-    set_state(c, ST_READ_HEAD, now + (c->len > 0 ? HEADER_TIMEOUT_MS : IDLE_TIMEOUT_MS));
+    set_state(c, ST_READ_HEAD, now + (c->len > 0 ? c->cfg->header_timeout_ms : c->cfg->keepalive_timeout_ms));
 }
 
 /* 응답을 다 보냈다. keep-alive 면 같은 연결로 다음 요청, 아니면 닫기. */
@@ -843,7 +840,7 @@ static void process_head(struct conn *c, size_t head_len, long long now)
         c->body_have = in_buf;
         memcpy(c->body, c->buf + head_len, in_buf);
         if (c->body_have < clen) {
-            set_state(c, ST_READ_BODY, now + BODY_TIMEOUT_MS);
+            set_state(c, ST_READ_BODY, now + c->cfg->body_timeout_ms);
             return; /* 나머지는 POLLIN 이 올 때마다 on_read_body 가 채운다 */
         }
     }
@@ -893,7 +890,7 @@ static void on_read_head(struct conn *c, short revents, long long now)
     if (n <= 0)
         return;
     if (c->len == 0)
-        c->deadline = now + HEADER_TIMEOUT_MS; /* 첫 바이트: 여기서부터 헤더 마감 시작 */
+        c->deadline = now + c->cfg->header_timeout_ms; /* 첫 바이트: 여기서부터 헤더 마감 시작 */
     c->len += (size_t)n;
 }
 
@@ -1051,10 +1048,10 @@ void conn_timeout(struct conn *c, long long now)
     case ST_READ_HEAD:
         if (c->len == 0) {
             conn_log(c, c->served > 0 ? "idle %d ms, closing" : "no request within %d ms, closing",
-                     IDLE_TIMEOUT_MS);
+                     c->cfg->keepalive_timeout_ms);
             close_now(c);
         } else {
-            conn_log(c, "header timed out after %d ms (%zu bytes)", HEADER_TIMEOUT_MS, c->len);
+            conn_log(c, "header timed out after %d ms (%zu bytes)", c->cfg->header_timeout_ms, c->len);
             fail(c, 408, now);
         }
         break;
