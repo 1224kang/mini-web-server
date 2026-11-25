@@ -27,7 +27,7 @@
 #define SEND_TIMEOUT_MS   10000 /* 한 바이트도 못 보내고 버틸 수 있는 시간 (안 읽는 클라이언트) */
 #define LINGER_TIMEOUT_MS 1000  /* 닫기 전 남은 입력을 비우는 최대 시간 */
 #define LINGER_MAX_BYTES  (64 * 1024)
-/* CGI 타임아웃은 설정 파일에서 (config.h) */
+/* CGI/백엔드 타임아웃은 설정 파일에서 (config.h) */
 #define UPSTREAM_MAX_RESPONSE (16 * 1024 * 1024) /* 업스트림 응답을 통째로 모아 둘 최대 크기 */
 #define MAX_REQUESTS_PER_CONN 100
 
@@ -39,7 +39,7 @@
 enum conn_state {
     ST_READ_HEAD, /* 요청 헤더를 모으는 중 (len == 0 이면 "다음 요청을 기다리며 노는 중") */
     ST_READ_BODY, /* Content-Length 만큼 본문을 모으는 중 */
-    ST_UPSTREAM,  /* CGI 에 넘기고 답을 기다리는 중 (5단계) */
+    ST_UPSTREAM,  /* CGI/백엔드에게 넘기고 답을 기다리는 중 (5·6단계) */
     ST_WRITE,     /* 응답(헤더 + 본문 또는 파일)을 내보내는 중 */
     ST_LINGER,    /* FIN 을 보냈고, 상대가 닫을 때까지 남은 입력을 버리는 중 */
     ST_DONE,      /* 루프가 정리하면 됨 */
@@ -48,6 +48,8 @@ enum conn_state {
 /* 스레드 풀 버전에선 이 정보 대부분이 "워커 스택의 지역 변수 + 지금 실행 중인 줄"에
  * 자연스럽게 들어 있었다. 이벤트 루프에선 중간에 손을 놓고 루프로 돌아가야 하므로
  * "어디까지 했는지"를 전부 여기 적어 둬야 한다. 이게 상태 머신이다. */
+enum up_kind { UP_NONE, UP_CGI, UP_PROXY };
+
 struct conn {
     int fd;
     unsigned long id;
@@ -81,14 +83,19 @@ struct conn {
 
     size_t drained; /* LINGER 에서 버린 바이트 */
 
-    /* ---- CGI: stdin 파이프에 쓰고 stdout 파이프에서 읽는다 ---- */
+    /* ---- 업스트림 (CGI / 프록시) ----
+     *   CGI  : up_in_fd = 자식 stdin 파이프(본문을 쓴다), up_out_fd = 자식 stdout 파이프(읽는다)
+     *   프록시: up_in_fd = -1,                         up_out_fd = 백엔드 소켓(쓰고 읽는다) */
+    enum up_kind up_kind;
     pid_t cgi_pid;          /* 아직 cgi_release 하지 않은 자식 (0 이면 없음) */
     int up_in_fd, up_out_fd;
-    const char *up_send;    /* CGI 에 보낼 요청 본문 */
+    int up_connecting;      /* 프록시: non-blocking connect 가 아직 진행 중 */
+    const char *up_send;    /* 업스트림에 보낼 것 (CGI: 요청 본문, 프록시: 다시 쓴 요청) */
     size_t up_send_len, up_send_sent;
+    char *up_req;           /* 프록시: 다시 쓴 요청 (up_send 가 가리킴, 우리가 해제) */
     char *up_buf;           /* 업스트림이 보낸 것 전부 */
     size_t up_len, up_cap;
-    char up_name[PATH_MAX]; /* 로그용: 스크립트 경로 */
+    char up_name[PATH_MAX]; /* 로그용: 스크립트 경로 또는 백엔드 주소 */
 };
 
 static unsigned long total_requests; /* 스레드가 하나라 lock 이 필요 없다 */
@@ -137,10 +144,13 @@ static void release_upstream(struct conn *c)
     if (c->cgi_pid > 0)
         cgi_release(c->cgi_pid, 1);
     c->cgi_pid = 0;
+    free(c->up_req);
     free(c->up_buf);
-    c->up_buf = NULL;
+    c->up_req = c->up_buf = NULL;
     c->up_send = NULL;
     c->up_send_len = c->up_send_sent = c->up_len = c->up_cap = 0;
+    c->up_connecting = 0;
+    c->up_kind = UP_NONE;
 }
 
 static void release_response(struct conn *c)
@@ -443,15 +453,20 @@ static void serve_file(struct conn *c, int head_only, long long now)
 }
 
 /* ------------------------------------------------------------------ */
-/* CGI 입출력 (5단계): 보내기, 받기, 실패, 완료                          */
+/* 업스트림 공통 (5·6단계): 보내기, 받기, 실패, 완료                          */
 /* ------------------------------------------------------------------ */
 
+static const char *up_label(const struct conn *c)
+{
+    return c->up_kind == UP_CGI ? "cgi" : "proxy";
+}
+
 /* 업스트림 쪽 문제는 클라이언트 잘못이 아니다. 요청은 끝까지 받았으니 연결은 계속 쓸 수 있다.
- *   502 Bad Gateway    : 업스트림이 "틀린" 답을 했다 (실행 실패, 망가진 응답)
+ *   502 Bad Gateway    : 업스트림이 "틀린" 답을 했다 (연결 거부, 실행 실패, 망가진 응답)
  *   504 Gateway Timeout: 업스트림이 "제때" 답을 안 했다 */
 static void upstream_fail(struct conn *c, int status, const char *why, long long now)
 {
-    conn_log(c, "cgi %s: %s -> %d", c->up_name, why, status);
+    conn_log(c, "%s %s: %s -> %d", up_label(c), c->up_name, why, status);
     release_upstream(c); /* CGI 가 아직 돌고 있으면 여기서 SIGKILL */
     send_error(c, status, NULL, now);
 }
@@ -461,27 +476,34 @@ static void upstream_fail(struct conn *c, int status, const char *why, long long
  * 클라이언트와의 keep-alive 를 그대로 유지할 수 있다. (대신 응답 크기에 상한이 있다) */
 static void upstream_complete(struct conn *c, long long now)
 {
-    if (c->cgi_pid > 0) {
+    if (c->up_kind == UP_CGI && c->cgi_pid > 0) {
         /* stdout 이 닫혔다 = 자식이 끝났거나 곧 끝난다. 이미 끝났으면 바로 거두고,
          * 아니면 고아 목록에 넣어 SIGCHLD 때 거둔다. (죽이지는 않는다) */
         cgi_release(c->cgi_pid, 0);
         c->cgi_pid = 0;
     }
     struct upstream_response r;
-    if (upstream_parse_response(c->up_buf ? c->up_buf : "", c->up_len, &r) < 0) {
+    enum upstream_kind kind = c->up_kind == UP_CGI ? UPSTREAM_CGI : UPSTREAM_HTTP;
+    if (upstream_parse_response(c->up_buf ? c->up_buf : "", c->up_len, kind, &r) < 0) {
         upstream_fail(c, 502, c->up_len == 0 ? "empty response" : "malformed response", now);
+        return;
+    }
+    if (kind == UPSTREAM_HTTP && !c->head_only && r.content_length >= 0 &&
+        r.body_len < (size_t)r.content_length) {
+        upstream_fail(c, 502, "response truncated", now); /* 백엔드가 보내다 죽었다 */
         return;
     }
     size_t out_len;
     char *out = upstream_build_client_response(&r, c->head_only, c->keep_alive && !c->stopping,
+                                               kind == UPSTREAM_HTTP ? "1.1 mini-web-server" : NULL,
                                                &out_len);
     if (!out) {
         upstream_fail(c, 500, "cannot build response", now);
         return;
     }
     /* r 은 up_buf 안을 가리키므로 release_upstream 전에 로그를 만들어 둔다. */
-    snprintf(c->summary, sizeof(c->summary), "<- %d %s from cgi %s (%zu bytes body)", r.status,
-             r.reason, c->up_name, r.body_len);
+    snprintf(c->summary, sizeof(c->summary), "<- %d %s from %s %s (%zu bytes body)", r.status,
+             r.reason, up_label(c), c->up_name, r.body_len);
     release_upstream(c);
 
     c->out = out;
@@ -516,22 +538,25 @@ static void upstream_read(struct conn *c, long long now)
         upstream_fail(c, 502, strerror(errno), now);
         return;
     }
-    if (n == 0) { /* EOF: CGI 가 stdout 을 닫음 = 응답 끝 */
+    if (n == 0) { /* EOF: CGI 가 stdout 을 닫음 / 백엔드가 연결을 닫음 = 응답 끝 */
         upstream_complete(c, now);
         return;
     }
     c->up_len += (size_t)n;
+    if (c->up_kind == UP_PROXY) /* 백엔드: "조용한 시간"이 proxy_timeout 을 넘으면 504 */
+        c->deadline = now + c->cfg->proxy_timeout_ms;
 }
 
 /* up_send 를 보낼 수 있는 만큼 보낸다. CGI 는 다 보내면 stdin 을 닫아 "본문 끝(EOF)"을 알린다. */
 static void upstream_write(struct conn *c, long long now)
 {
+    int fd = c->up_kind == UP_CGI ? c->up_in_fd : c->up_out_fd;
     while (c->up_send_sent < c->up_send_len) {
-        ssize_t n = write(c->up_in_fd, c->up_send + c->up_send_sent, c->up_send_len - c->up_send_sent);
+        ssize_t n = write(fd, c->up_send + c->up_send_sent, c->up_send_len - c->up_send_sent);
         if (n < 0) {
             if (would_block())
-                return; /* 파이프 버퍼가 꽉 참 → POLLOUT 을 기다린다 */
-            if (errno == EPIPE) {
+                return; /* 파이프/소켓 버퍼가 꽉 참 → POLLOUT 을 기다린다 */
+            if (c->up_kind == UP_CGI && errno == EPIPE) {
                 /* 스크립트가 본문을 다 안 읽고 stdin 을 닫았다. 흔한 일이라 에러가 아니다.
                  * (SIGPIPE 를 무시해 뒀기 때문에 서버가 죽지 않고 여기로 온다) */
                 c->up_send_sent = c->up_send_len;
@@ -542,8 +567,11 @@ static void upstream_write(struct conn *c, long long now)
         }
         c->up_send_sent += (size_t)n;
     }
-    close(c->up_in_fd);
-    c->up_in_fd = -1;
+    if (c->up_kind == UP_CGI) {
+        close(c->up_in_fd);
+        c->up_in_fd = -1;
+    }
+    /* 프록시: 다 보냈으니 이제 conn_pollfds 가 POLLOUT 대신 POLLIN 을 건다 */
 }
 
 /* ------------------------------------------------------------------ */
@@ -632,6 +660,7 @@ static void start_cgi(struct conn *c, long long now)
     }
 
     /* 5) 이제부터 이 연결은 자식의 두 파이프를 poll 한다 */
+    c->up_kind = UP_CGI;
     c->cgi_pid = pid;
     c->up_in_fd = in_fd;
     c->up_out_fd = out_fd;
@@ -646,14 +675,87 @@ static void start_cgi(struct conn *c, long long now)
 }
 
 /* ------------------------------------------------------------------ */
+/* 6단계: 리버스 프록시                                                   */
+/* ------------------------------------------------------------------ */
+
+/* 클라이언트는 우리 서버에게 물었다고 생각한다. 실제 답은 백엔드가 하고, 우리는
+ * 요청을 다시 써서 넘기고(Host, X-Forwarded-For), 답을 다시 써서 돌려준다(Connection, Via). */
+static void start_proxy(struct conn *c, struct proxy_route *route, long long now)
+{
+    const struct backend *b = config_pick_backend(route); /* Round-Robin */
+    c->up_kind = UP_PROXY;
+    snprintf(c->up_name, sizeof(c->up_name), "%s", b->name);
+
+    c->up_req = proxy_build_request(&c->req, c->body, c->body_len, c->peer_ip, b->name,
+                                    &c->up_send_len);
+    if (!c->up_req) {
+        upstream_fail(c, 500, "cannot build request", now);
+        return;
+    }
+    c->up_send = c->up_req;
+    c->up_send_sent = 0;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        upstream_fail(c, 502, strerror(errno), now);
+        return;
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    c->up_out_fd = fd;
+    c->state = ST_UPSTREAM;
+    conn_log(c, "proxy %s %s -> %s (route %s)", c->req.method, c->req.target, b->name,
+             route->prefix);
+
+    /* non-blocking connect: 바로 끝나지 않으면 EINPROGRESS 를 돌려주고, 연결이 되든 실패하든
+     * 소켓이 "쓸 수 있음(POLLOUT)"이 된다. 결과는 그때 SO_ERROR 로 확인한다. */
+    if (connect(fd, (const struct sockaddr *)&b->addr, sizeof(b->addr)) == 0) {
+        c->deadline = now + c->cfg->proxy_timeout_ms;
+        upstream_write(c, now);
+    } else if (errno == EINPROGRESS) {
+        c->up_connecting = 1;
+        c->deadline = now + c->cfg->proxy_connect_timeout_ms;
+    } else {
+        upstream_fail(c, 502, strerror(errno), now); /* 보통 ECONNREFUSED: 백엔드가 죽어 있다 */
+    }
+}
+
+static void proxy_io(struct conn *c, short revents, long long now)
+{
+    if (c->up_connecting) {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (getsockopt(c->up_out_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+            err = errno;
+        if (err) {
+            upstream_fail(c, 502, strerror(err), now);
+            return;
+        }
+        c->up_connecting = 0;
+        c->deadline = now + c->cfg->proxy_timeout_ms;
+    }
+    if (c->up_send_sent < c->up_send_len) {
+        upstream_write(c, now);
+        return;
+    }
+    if (revents & (POLLIN | POLLHUP | POLLERR))
+        upstream_read(c, now);
+}
+
+/* ------------------------------------------------------------------ */
 /* 어디로 보낼까                                                         */
 /* ------------------------------------------------------------------ */
 
-/* 우선순위: /cgi-bin/ → /builtin/ → 정적 파일 */
+/* 우선순위: 프록시 경로 → /cgi-bin/ → /builtin/ → 정적 파일 */
 static void dispatch(struct conn *c, long long now)
 {
     const char *t = c->req.target, *m = c->req.method;
 
+    struct proxy_route *route = config_match_route(c->cfg, t);
+    if (route) {
+        start_proxy(c, route, now);
+        return;
+    }
     if (c->cfg->cgi_dir[0] && strncmp(t, CGI_PREFIX, strlen(CGI_PREFIX)) == 0) {
         start_cgi(c, now);
         return;
@@ -850,8 +952,12 @@ int conn_pollfds(const struct conn *c, struct pollfd *out)
          * 서로를 영원히 기다린다(교착). */
         if (c->up_in_fd >= 0)
             out[n++] = (struct pollfd){ .fd = c->up_in_fd, .events = POLLOUT };
-        if (c->up_out_fd >= 0)
-            out[n++] = (struct pollfd){ .fd = c->up_out_fd, .events = POLLIN };
+        if (c->up_out_fd >= 0) {
+            short ev = POLLIN;
+            if (c->up_kind == UP_PROXY && (c->up_connecting || c->up_send_sent < c->up_send_len))
+                ev = POLLOUT; /* 연결 완료 / 요청 보내기를 기다리는 중 */
+            out[n++] = (struct pollfd){ .fd = c->up_out_fd, .events = ev };
+        }
     }
     return n;
 }
@@ -872,7 +978,7 @@ void conn_handle(struct conn *c, const struct pollfd *pfds, int n, long long now
     if (c->state == ST_UPSTREAM) {
         if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
             /* events=0 이어도 이 셋은 보고된다. 무시하면 poll 이 매번 즉시 돌아와 헛돈다. */
-            conn_log(c, "client went away while waiting for CGI");
+            conn_log(c, "client went away while waiting for %s", up_label(c));
             release_upstream(c);
             close_now(c);
             return;
@@ -882,6 +988,8 @@ void conn_handle(struct conn *c, const struct pollfd *pfds, int n, long long now
                 continue;
             if (pfds[i].fd == c->up_in_fd)
                 upstream_write(c, now);
+            else if (pfds[i].fd == c->up_out_fd && c->up_kind == UP_PROXY)
+                proxy_io(c, pfds[i].revents, now);
             else if (pfds[i].fd == c->up_out_fd)
                 upstream_read(c, now);
         }
@@ -914,7 +1022,10 @@ void conn_timeout(struct conn *c, long long now)
         fail(c, 408, now);
         break;
     case ST_UPSTREAM:
-        upstream_fail(c, 504, "timed out, killing", now);
+        if (c->up_kind == UP_CGI)
+            upstream_fail(c, 504, "timed out, killing", now);
+        else
+            upstream_fail(c, 504, c->up_connecting ? "connect timed out" : "response timed out", now);
         break;
     case ST_WRITE:
         conn_log(c, "send timed out (client not reading)");

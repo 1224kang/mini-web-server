@@ -8,7 +8,7 @@ OBJS    := $(SRCS:.c=.o)
 
 TEST_BIN := tests/test_http tests/test_static tests/test_dynamic
 
-.PHONY: all clean run asan test smoke smoke-concurrency smoke-dynamic
+.PHONY: all clean run run-proxy backends asan test smoke smoke-concurrency smoke-dynamic
 
 all: $(TARGET)
 
@@ -43,12 +43,22 @@ smoke: $(TARGET)
 smoke-concurrency: $(TARGET)
 	python3 tests/smoke_concurrency.py
 
-# 5단계: CGI, 내장 핸들러
+# 5·6단계: CGI, 내장 핸들러, 리버스 프록시 (백엔드를 띄웠다 죽였다 함)
 smoke-dynamic: $(TARGET)
 	python3 tests/smoke_dynamic.py
 
 run: $(TARGET)
 	./$(TARGET) $(PORT) www
+
+# 6단계 데모: 다른 터미널에서 make backends 를 먼저 띄운다
+run-proxy: $(TARGET)
+	./$(TARGET) -c conf/proxy.conf $(PORT) www
+
+# 테스트용 백엔드 3개 (Ctrl+C 로 같이 종료)
+backends:
+	trap 'kill 0' INT TERM; \
+	python3 tests/backend.py 8001 & python3 tests/backend.py 8002 & python3 tests/backend.py 8003 & \
+	wait
 
 # 메모리 오류 검사용 빌드 (7단계에서 본격적으로 사용)
 asan: CFLAGS += -fsanitize=address -fno-omit-frame-pointer

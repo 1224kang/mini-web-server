@@ -85,8 +85,8 @@ static int name_is(const char *name, size_t len, const char *want)
 
 int upstream_is_hop_by_hop(const char *name, size_t len)
 {
-    /* 이 헤더들은 한 연결에만 적용된다. CGI 출력에서 가져오지 않고
-     * 클라이언트 연결에 맞춰 응답을 만든다. (RFC 9110 7.6.1) */
+    /* 이 헤더들은 "지금 이 TCP 연결"의 사정이다. 클라이언트↔우리, 우리↔백엔드는 서로 다른
+     * 연결이므로 한쪽 값을 다른 쪽에 그대로 옮기면 안 된다. (RFC 9110 7.6.1) */
     static const char *const hop[] = {
         "Connection", "Keep-Alive", "Proxy-Connection", "Transfer-Encoding",
         "TE", "Trailer", "Upgrade", "Proxy-Authenticate", "Proxy-Authorization",
@@ -138,14 +138,29 @@ static int parse_status(const char *p, size_t len, int *status, char *reason, si
     return 0;
 }
 
-int upstream_parse_response(const char *buf, size_t len,
+int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind,
                             struct upstream_response *out)
 {
     memset(out, 0, sizeof(*out));
     out->content_length = -1;
     size_t pos = 0;
 
-    int has_status = 0, has_location = 0;
+    if (kind == UPSTREAM_HTTP) {
+        /* 상태 줄: "HTTP/1.0 200 OK" */
+        const char *nl = memchr(buf, '\n', len);
+        if (!nl)
+            return -1;
+        size_t llen = (size_t)(nl - buf);
+        if (llen > 0 && buf[llen - 1] == '\r')
+            llen--;
+        if (llen < 12 || memcmp(buf, "HTTP/1.", 7) != 0 || !isdigit((unsigned char)buf[7]) ||
+            buf[8] != ' ' ||
+            parse_status(buf + 9, llen - 9, &out->status, out->reason, sizeof(out->reason)) < 0)
+            return -1;
+        pos = (size_t)(nl - buf) + 1;
+    }
+
+    int has_status = kind == UPSTREAM_HTTP, has_location = 0;
     out->head = buf + pos;
     for (;;) {
         const char *nl = memchr(buf + pos, '\n', len - pos);
@@ -186,12 +201,14 @@ int upstream_parse_response(const char *buf, size_t len,
                 cl = cl * 10 + (v[i] - '0');
             }
             out->content_length = cl;
-        } else if (name_is(line, nlen, "Status")) {
+        } else if (kind == UPSTREAM_CGI && name_is(line, nlen, "Status")) {
             if (parse_status(v, vlen, &out->status, out->reason, sizeof(out->reason)) < 0)
                 return -1;
             has_status = 1;
-        } else if (name_is(line, nlen, "Location")) {
+        } else if (kind == UPSTREAM_CGI && name_is(line, nlen, "Location")) {
             has_location = 1;
+        } else if (kind == UPSTREAM_HTTP && name_is(line, nlen, "Transfer-Encoding")) {
+            return -1; /* HTTP/1.0 으로 물었으니 chunked 가 오면 안 된다 */
         }
         pos = (size_t)(nl - buf) + 1;
     }
@@ -205,6 +222,9 @@ int upstream_parse_response(const char *buf, size_t len,
 
     out->body = buf + pos;
     out->body_len = len - pos;
+    if (kind == UPSTREAM_HTTP && out->content_length >= 0 &&
+        (size_t)out->content_length < out->body_len)
+        out->body_len = (size_t)out->content_length; /* 남는 바이트는 버린다 */
     return 0;
 }
 
@@ -214,7 +234,7 @@ static int status_has_no_body(int status)
 }
 
 char *upstream_build_client_response(const struct upstream_response *r, int head_only,
-                                     int keep_alive, size_t *out_len)
+                                     int keep_alive, const char *via, size_t *out_len)
 {
     /* 업스트림 응답의 Connection 헤더 값 (거기 적힌 헤더도 빼야 한다) */
     const char *conn_v = "";
@@ -253,14 +273,61 @@ char *upstream_build_client_response(const struct upstream_response *r, int head
 
     int no_body = status_has_no_body(r->status);
     if (!no_body) {
-        /* HEAD 응답에는 본문 없이 CGI 가 알려 준 Content-Length 를 쓴다 */
+        /* HEAD 에 대한 백엔드 응답은 본문 없이 Content-Length 만 온다 → 그 값을 그대로 */
         size_t cl = head_only && r->content_length >= 0 ? (size_t)r->content_length : r->body_len;
         sb_printf(&s, "Content-Length: %zu\r\n", cl);
     }
     sb_printf(&s, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
+    if (via)
+        sb_printf(&s, "Via: %s\r\n", via);
     sb_mem(&s, "\r\n", 2);
     if (!head_only && !no_body)
         sb_mem(&s, r->body, r->body_len);
+    return sb_finish(&s, out_len);
+}
+
+/* ------------------------------------------------------------------ */
+/* 프록시 요청 다시 쓰기                                                  */
+/* ------------------------------------------------------------------ */
+
+char *proxy_build_request(const struct http_request *req, const char *body, size_t body_len,
+                          const char *client_ip, const char *backend_host, size_t *out_len)
+{
+    const char *conn_v = http_get_header(req, "Connection");
+    size_t conn_len = conn_v ? strlen(conn_v) : 0;
+    const char *orig_host = http_get_header(req, "Host");
+
+    struct sb s = { 0 };
+    sb_printf(&s, "%s %s HTTP/1.0\r\n", req->method, req->target);
+    sb_printf(&s, "Host: %s\r\n", backend_host);
+
+    struct sb xff = { 0 }; /* 앞 프록시들이 남긴 X-Forwarded-For 를 모두 이어 붙인다 */
+    for (size_t i = 0; i < req->header_count; i++) {
+        const char *n = req->headers[i].name, *v = req->headers[i].value;
+        size_t nlen = strlen(n);
+        if (name_is(n, nlen, "X-Forwarded-For")) {
+            sb_printf(&xff, "%s%s", xff.len ? ", " : "", v);
+            continue;
+        }
+        if (upstream_is_hop_by_hop(n, nlen) || name_is(n, nlen, "Host") ||
+            name_is(n, nlen, "Content-Length") || name_is(n, nlen, "Expect") ||
+            name_is(n, nlen, "X-Forwarded-Host") || name_is(n, nlen, "X-Forwarded-Proto") ||
+            (conn_v && listed_in_connection(conn_v, conn_len, n, nlen)))
+            continue;
+        sb_printf(&s, "%s: %s\r\n", n, v);
+    }
+    sb_printf(&xff, "%s%s", xff.len ? ", " : "", client_ip);
+    sb_printf(&s, "X-Forwarded-For: %s\r\n", xff.err ? client_ip : xff.p);
+    free(xff.p);
+    if (orig_host)
+        sb_printf(&s, "X-Forwarded-Host: %s\r\n", orig_host);
+    sb_printf(&s, "X-Forwarded-Proto: http\r\n");
+    sb_printf(&s, "Via: %s mini-web-server\r\n", strcmp(req->version, "HTTP/1.0") == 0 ? "1.0" : "1.1");
+    if (body_len > 0 || strcmp(req->method, "POST") == 0 || strcmp(req->method, "PUT") == 0)
+        sb_printf(&s, "Content-Length: %zu\r\n", body_len);
+    sb_printf(&s, "Connection: close\r\n\r\n");
+    if (body_len > 0)
+        sb_mem(&s, body, body_len);
     return sb_finish(&s, out_len);
 }
 

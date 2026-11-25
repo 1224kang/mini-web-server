@@ -1,16 +1,34 @@
 #ifndef UPSTREAM_H
 #define UPSTREAM_H
 
-/* CGI 요청 환경변수와 출력 변환. 파이프 입출력은 conn.c 에서 맡는다. */
+/*
+ * "업스트림" = 우리 서버가 요청을 대신 넘기는 상대. 5단계의 CGI 프로그램, 6단계의 백엔드 서버.
+ *
+ * 둘은 겉모습만 다르고 하는 일은 같다.
+ *
+ *   클라이언트 ──요청──▶ [우리 서버] ──(바꿔서) 넘김──▶ 업스트림
+ *   클라이언트 ◀──응답── [우리 서버] ◀──(고쳐서) 받음── 업스트림
+ *
+ *   CGI : 요청 → 환경변수 + stdin,   응답 ← stdout ("Content-Type: ...\n\n본문")
+ *   프록시: 요청 → HTTP 요청 다시 쓰기, 응답 ← HTTP 응답 ("HTTP/1.0 200 OK\r\n...\r\n\r\n본문")
+ *
+ * 이 파일은 소켓/프로세스를 전혀 모르는 "문자열 변환" 함수만 모았다 → 단위 테스트 가능.
+ * 실제 fork/exec, connect, read/write 는 cgi.c 와 conn.c 가 한다.
+ */
 
 #include "http.h"
 
 #include <stddef.h>
 
+enum upstream_kind {
+    UPSTREAM_CGI,  /* 응답 = CGI 출력 (상태는 "Status:" 헤더로) */
+    UPSTREAM_HTTP, /* 응답 = HTTP 응답 (상태는 첫 줄로) */
+};
+
 struct upstream_response {
     int status;
     char reason[64];
-    const char *head;     /* CGI 출력 맨 앞부터 헤더 줄들 */
+    const char *head;     /* 헤더 줄들 (CGI: 출력 맨 앞부터, HTTP: 상태 줄 다음부터) */
     size_t head_len;      /* 빈 줄 직전까지 */
     const char *body;
     size_t body_len;
@@ -18,15 +36,26 @@ struct upstream_response {
 };
 
 /* 업스트림이 보낸 전체 출력 buf[0..len) 을 해석한다. 형식이 틀렸으면 -1 (→ 502). */
-int upstream_parse_response(const char *buf, size_t len,
+int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind,
                             struct upstream_response *out);
 
 /* 클라이언트에게 보낼 응답(상태 줄 + 헤더 + 본문)을 malloc 해서 돌려준다.
  * 업스트림 헤더는 대부분 그대로 옮기되, "이 연결에서만 의미 있는" hop-by-hop 헤더
  * (Connection, Keep-Alive, Transfer-Encoding, ...)와 Content-Length 는 버리고 우리 값으로 다시 쓴다.
- * 실패하면 NULL. */
+ * via 가 NULL 이 아니면 "Via: <via>" 를 붙인다. 실패하면 NULL. */
 char *upstream_build_client_response(const struct upstream_response *r, int head_only,
-                                     int keep_alive, size_t *out_len);
+                                     int keep_alive, const char *via, size_t *out_len);
+
+/* 프록시: 클라이언트 요청을 백엔드에게 보낼 요청으로 다시 쓴다 (malloc, 실패하면 NULL).
+ *
+ *   - 백엔드와는 HTTP/1.0 + "Connection: close": 응답 끝 = 연결 끝이라 읽기가 단순해지고,
+ *     HTTP/1.0 상대에게는 chunked 인코딩을 쓸 수 없으므로 본문 형식도 단순해진다.
+ *   - Host                → 백엔드 주소로 바꾸고, 원래 Host 는 X-Forwarded-Host 로 보낸다.
+ *   - X-Forwarded-For     → 기존 값 뒤에 ", <클라이언트 IP>" 를 덧붙인다(프록시를 여러 번 거쳐도 경로가 남게).
+ *   - X-Forwarded-Proto   → "http"
+ *   - hop-by-hop 헤더와 Expect 는 버린다. */
+char *proxy_build_request(const struct http_request *req, const char *body, size_t body_len,
+                          const char *client_ip, const char *backend_host, size_t *out_len);
 
 /* CGI/1.1 환경변수 배열을 만든다 ("NAME=value" 문자열들, 끝은 NULL).
  * 요청 헤더 "User-Agent: x" 는 "HTTP_USER_AGENT=x" 가 된다.

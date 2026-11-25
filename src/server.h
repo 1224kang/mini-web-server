@@ -15,7 +15,7 @@ int server_listen(int port);
 /* 단일 스레드 이벤트 루프를 돌린다. stop_fd 가 "읽을 수 있음"이 되면 우아한 종료를 시작하고,
  * 열린 연결이 모두 끝나면 돌아온다(listen_fd 는 여기서 닫는다).
  * 동시에 열어 둘 연결은 max_conns 개까지, 넘치면 503.
- * 요청은 /cgi-bin/ → /builtin/ → 정적 파일(GET/HEAD) 순으로 처리한다. */
+ * 요청은 프록시 경로 → /cgi-bin/ → /builtin/ → 정적 파일(GET/HEAD) 순으로 처리한다. */
 int server_run(int listen_fd, int stop_fd, struct server_config *cfg, int max_conns,
                struct server_stats *stats);
 

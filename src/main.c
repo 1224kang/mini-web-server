@@ -147,7 +147,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* CGI 디렉토리 (cgi_dir 기본값 "./cgi-bin" 은 현재 디렉토리 기준) */
+    /* CGI 디렉토리, 프록시 경로 (cgi_dir 기본값 "./cgi-bin" 은 현재 디렉토리 기준) */
     static struct server_config cfg;
     config_defaults(&cfg);
     if (conf_path && config_load(&cfg, conf_path) < 0)
@@ -168,6 +168,14 @@ int main(int argc, char **argv)
            port, docroot, max_conns, fd_limit);
     if (cfg.cgi_dir[0])
         printf("  cgi:   /cgi-bin/* -> %s (timeout %d ms)\n", cfg.cgi_dir, cfg.cgi_timeout_ms);
+    for (int i = 0; i < cfg.nroutes; i++) {
+        printf("  proxy: %s* ->", cfg.routes[i].prefix);
+        for (int j = 0; j < cfg.routes[i].nbackends; j++)
+            printf(" %s", cfg.routes[i].backends[j].name);
+        printf(" (round-robin, connect %d ms, response %d ms)\n", cfg.proxy_connect_timeout_ms,
+               cfg.proxy_timeout_ms);
+    }
+
     /* 여기서 루프가 돈다. 종료 신호를 받고 열린 연결이 다 끝나면 돌아온다. */
     struct server_stats s = { 0 };
     int rc = server_run(listen_fd, stop_pipe[0], &cfg, (int)max_conns, &s);

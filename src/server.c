@@ -18,7 +18,7 @@
  * 단일 스레드 이벤트 루프.
  *
  *   for (;;) {
- *       poll([listen, stop, 자식회수, 연결1(+CGI 파이프), ...], 가장 가까운 마감까지)
+ *       poll([listen, stop, 자식회수, 연결1(+CGI 파이프/백엔드 소켓), ...], 가장 가까운 마감까지)
  *       준비된 연결마다 conn_handle()  ← 할 수 있는 만큼만 하고 즉시 돌아온다
  *       마감 지난 연결마다 conn_timeout()
  *       새 연결 accept, 끝난 연결 정리
@@ -104,7 +104,7 @@ void server_reject_busy(int client_fd)
 }
 
 struct loop {
-    struct server_config *cfg; //docroot, CGI 설정
+    struct server_config *cfg; //docroot, CGI, 프록시 설정
     int listen_fd; //listen 소켓의 fd 
     int max_conns; //동시에 열어 둘 수 있는 최대 연결 수 
     struct conn **conns; /* 살아 있는 연결들 (순서 없음) */
@@ -186,7 +186,7 @@ int server_run(int listen_fd, int stop_fd, struct server_config *cfg, int max_co
         .max_conns = max_conns,
     };
     /* poll 배열: [listen][stop][reap][연결 0 의 fd 1~3개][연결 1 의 fd 1~3개]...
-     * 연결마다 fd 수가 달라서(정적 파일 1개, CGI 최대 3개) 각 연결의 시작 칸과 칸 수를 따로 적는다. */
+     * 연결마다 fd 수가 달라서(정적 파일 1개, CGI 3개, 프록시 2개) 각 연결의 시작 칸과 칸 수를 따로 적는다. */
     L.conns = calloc((size_t)max_conns, sizeof(*L.conns));
     struct pollfd *pfds = calloc((size_t)max_conns * CONN_MAX_FDS + 3, sizeof(*pfds));
     int *first = calloc((size_t)max_conns, sizeof(*first));
