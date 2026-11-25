@@ -23,7 +23,9 @@
 /* http_read_request() 의 특수 반환값 (양수는 클라이언트에 보낼 HTTP 에러 상태 코드) */
 #define HTTP_READ_OK        0
 #define HTTP_READ_EOF      (-1)   /* 요청을 한 바이트도 보내지 않고 연결이 닫힘 */
-#define HTTP_READ_IO_ERROR (-2)   /* recv/send 실패 (RST, 타임아웃 등)         */
+#define HTTP_READ_IO_ERROR (-2)   /* recv/send 실패 (RST 등)                    */
+#define HTTP_READ_TIMEOUT  (-3)   /* Phase 3: 아무것도 오지 않은 채 SO_RCVTIMEO 만료
+                                     (요청을 보내다 멈춘 경우는 408 을 반환)      */
 
 typedef enum {
     HTTP_METHOD_UNKNOWN = 0,      /* 문법상 올바르지만 지원하지 않는 메서드 -> 405 */
@@ -53,6 +55,11 @@ typedef struct {
 
     char  *body;                           /* malloc. Content-Length 만큼, NUL 종료 */
     size_t body_len;
+
+    /* Phase 3: 응답 후 연결을 유지할지.
+     * 파서가 버전/Connection 헤더로 초기값을 정하고, 서버(종료 중, 요청 수 한도)와
+     * 핸들러(전송 실패, 길이를 모르는 프록시 응답)가 0 으로 내릴 수 있다. */
+    int    keep_alive;
 } http_request_t; //파싱 결과를 담는 구조체
 
 /* 연결 단위 수신 버퍼.
@@ -72,8 +79,9 @@ void http_request_init(http_request_t *req);
 void http_request_free(http_request_t *req);
 
 /* 요청 하나를 끝까지(헤더 + Content-Length 본문) 읽어 req를 채운다.
- * 반환: HTTP_READ_OK / HTTP_READ_EOF / HTTP_READ_IO_ERROR,
- *       또는 400, 413, 414, 500, 501, 505 같은 "응답해야 할 에러 상태 코드". */
+ * 반환: HTTP_READ_OK / HTTP_READ_EOF / HTTP_READ_IO_ERROR / HTTP_READ_TIMEOUT,
+ *       또는 400, 408, 413, 414, 500, 501, 505 같은 "응답해야 할 에러 상태 코드".
+ * 요청 뒤에 이어 온 바이트(파이프라이닝)는 conn->buf 에 남겨 다음 호출에서 사용한다. */
 int http_read_request(http_conn_t *conn, http_request_t *req);
 
 /* 소켓과 무관한 순수 파서. data[0..len) 은 "\r\n\r\n" 으로 끝나는 헤더 블록.
@@ -82,6 +90,12 @@ int http_parse_head(http_request_t *req, const char *data, size_t len);
 
 /* 대소문자 무시 헤더 조회. 없으면 NULL. */
 const char *http_get_header(const http_request_t *req, const char *name);
+
+/* "keep-alive, Upgrade" 처럼 쉼표로 구분된 헤더 값에 token 이 있는지 (대소문자 무시) */
+int http_header_has_token(const char *value, const char *token);
+
+/* "/a/../b" 처럼 정확히 ".." 인 경로 세그먼트가 있는지 (경로 탐색 1차 방어) */
+int http_path_has_dotdot(const char *path);
 
 /* ---------------------------------------------------------------- */
 /* 응답 (http_response.c)                                            */
@@ -93,11 +107,12 @@ int http_send_all(int fd, const void *buf, size_t len);
 
 /* 상태 줄 + 공통 헤더(Date, Server, Content-Type, Content-Length, Connection) 전송.
  * content_type 이 NULL 이면 Content-Type 생략.
- * extra_headers 는 "Name: value\r\n" 형태의 추가 헤더 묶음 (없으면 NULL). */
+ * extra_headers 는 "Name: value\r\n" 형태의 추가 헤더 묶음 (없으면 NULL).
+ * keep_alive 가 참이면 "Connection: keep-alive", 아니면 "Connection: close". */
 int http_send_head(int fd, int status, const char *content_type,
-                   long long content_length, const char *extra_headers);
+                   long long content_length, const char *extra_headers, int keep_alive);
 
-/* 기본 HTML 에러 페이지 전송 (400, 403, 404, 405, 413, 414, 500, 502, 504 ...). */
-int http_send_error(int fd, int status, const char *extra_headers);
+/* 기본 HTML 에러 페이지 전송 (400, 403, 404, 405, 408, 413, 414, 500, 502, 503, 504 ...). */
+int http_send_error(int fd, int status, const char *extra_headers, int keep_alive);
 
 #endif /* MINI_WEB_SERVER_HTTP_H */

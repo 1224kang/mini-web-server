@@ -13,14 +13,15 @@
 /* 끊긴 소켓에 write 할 때 SIGPIPE로 프로세스가 죽지 않도록 한다.
  * Linux: send()의 MSG_NOSIGNAL 플래그 / macOS: 소켓 옵션 SO_NOSIGPIPE (server.c 에서 설정).
  * 이렇게 하면 두 OS 모두 send()가 시그널 대신 -1과 errno = EPIPE를 반환합니다.
- * (프로세스 전역 SIGPIPE 무시는 Phase 5에서 추가) */
+ * (Phase 5 에서 프로세스 전역 SIGPIPE 무시도 추가했지만, 라이브러리처럼 단독으로
+ *  쓰여도 안전하도록 소켓 단위 방어는 그대로 둔다) */
 #ifdef MSG_NOSIGNAL
 #define SEND_FLAGS MSG_NOSIGNAL
 #else
 #define SEND_FLAGS 0
 #endif
 
-#define SERVER_SOFTWARE "mini-web-server/0.2"
+#define SERVER_SOFTWARE "mini-web-server/1.0"
 
 //상태 코드를 사유 문구로 바꿉니다
 const char *http_status_text(int status)
@@ -33,11 +34,13 @@ const char *http_status_text(int status)
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
     case 413: return "Payload Too Large";
     case 414: return "URI Too Long";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
     case 502: return "Bad Gateway";
+    case 503: return "Service Unavailable";
     case 504: return "Gateway Timeout";
     case 505: return "HTTP Version Not Supported";
     default:  return "Unknown";
@@ -77,7 +80,7 @@ static void format_http_date(char *out, size_t cap)
 
 //상태 줄과 공통 헤더를 한 번에 조립해서 보냅니다.
 int http_send_head(int fd, int status, const char *content_type,
-                   long long content_length, const char *extra_headers)
+                   long long content_length, const char *extra_headers, int keep_alive)
 {
     char date[64];
     char head[4096];
@@ -90,7 +93,7 @@ int http_send_head(int fd, int status, const char *content_type,
                      "Server: " SERVER_SOFTWARE "\r\n"
                      "%s%s%s"
                      "Content-Length: %lld\r\n"
-                     "Connection: close\r\n"
+                     "Connection: %s\r\n"
                      "%s"
                      "\r\n",
                      status, http_status_text(status),
@@ -99,6 +102,7 @@ int http_send_head(int fd, int status, const char *content_type,
                      content_type ? content_type : "",
                      content_type ? "\r\n" : "",
                      content_length,
+                     keep_alive ? "keep-alive" : "close",
                      extra_headers ? extra_headers : "");
     if (n < 0 || (size_t)n >= sizeof(head))
         return -1;
@@ -106,7 +110,7 @@ int http_send_head(int fd, int status, const char *content_type,
 }
 
 //에러 상태 코드로 작은 HTML 페이지를 만들어 보냅니다.
-int http_send_error(int fd, int status, const char *extra_headers)
+int http_send_error(int fd, int status, const char *extra_headers, int keep_alive)
 {
     char body[512];
     const char *text = http_status_text(status);
@@ -125,7 +129,7 @@ int http_send_error(int fd, int status, const char *extra_headers)
     if (n < 0 || (size_t)n >= sizeof(body))
         return -1;
 
-    if (http_send_head(fd, status, "text/html; charset=utf-8", n, extra_headers) < 0)
+    if (http_send_head(fd, status, "text/html; charset=utf-8", n, extra_headers, keep_alive) < 0)
         return -1;
     return http_send_all(fd, body, (size_t)n);
 }

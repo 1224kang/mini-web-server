@@ -100,6 +100,12 @@ static ssize_t recv_some(int fd, void *buf, size_t cap)
     }
 }
 
+/* Phase 3: SO_RCVTIMEO 가 만료되면 recv 는 -1 + EAGAIN(또는 EWOULDBLOCK) 을 돌려준다. */
+static int is_timeout_errno(int e)
+{
+    return e == EAGAIN || e == EWOULDBLOCK;
+}
+
 /* ------------------------------------------------------------------ */
 /* 초기화 / 해제                                                       */
 /* ------------------------------------------------------------------ */
@@ -130,6 +136,7 @@ void http_request_init(http_request_t *req)
     req->head_len      = 0;
     req->body          = NULL;
     req->body_len      = 0;
+    req->keep_alive    = 0;
 }
 
 
@@ -155,6 +162,44 @@ const char *http_get_header(const http_request_t *req, const char *name)
             return req->headers[i].value;
     }
     return NULL;
+}
+
+int http_header_has_token(const char *value, const char *token)
+{
+    size_t tlen = strlen(token);
+
+    if (value == NULL)
+        return 0;
+    while (*value != '\0') {
+        while (*value == ' ' || *value == '\t' || *value == ',')
+            value++;
+        const char *start = value;
+        while (*value != '\0' && *value != ',')
+            value++;
+        const char *end = value;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+            end--;
+        if ((size_t)(end - start) == tlen && strncasecmp(start, token, tlen) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* "/a/../b", "/..", "/a/.." 처럼 정확히 ".." 인 경로 세그먼트가 있는지 */
+int http_path_has_dotdot(const char *path)
+{
+    const char *p = path;
+
+    while (*p != '\0') {
+        while (*p == '/')
+            p++;
+        const char *seg = p;
+        while (*p != '\0' && *p != '/')
+            p++;
+        if (p - seg == 2 && seg[0] == '.' && seg[1] == '.')
+            return 1;
+    }
+    return 0;
 }
 
 //같은 이름의 헤더 개수를 셉니다. Host가 중복됐는지 검사할 때 씁니다.
@@ -342,6 +387,15 @@ int http_parse_head(http_request_t *req, const char *data, size_t len)
     if (hosts > 1 || (req->version_minor >= 1 && hosts == 0))
         return 400;
 
+    /* Phase 3: 지속 연결 여부 (RFC 7230 6.3)
+     *   HTTP/1.1 : 기본 유지, "Connection: close" 면 종료
+     *   HTTP/1.0 : 기본 종료, "Connection: keep-alive" 면 유지 */
+    const char *conn_hdr = http_get_header(req, "Connection");
+    if (req->version_minor >= 1)
+        req->keep_alive = !http_header_has_token(conn_hdr, "close");
+    else
+        req->keep_alive = http_header_has_token(conn_hdr, "keep-alive");
+
     return 0;
 }
 
@@ -416,7 +470,7 @@ static int read_body(http_conn_t *conn, http_request_t *req)
     while (have < len) {
         ssize_t n = recv_some(conn->fd, req->body + have, len - have);
         if (n < 0)
-            return HTTP_READ_IO_ERROR;
+            return is_timeout_errno(errno) ? 408 : HTTP_READ_IO_ERROR;
         if (n == 0)
             return 400;                   /* Content-Length 보다 일찍 끊김 */
         have += (size_t)n;
@@ -449,8 +503,12 @@ int http_read_request(http_conn_t *conn, http_request_t *req)
         }
 
         ssize_t n = recv_some(conn->fd, conn->buf + conn->len, sizeof(conn->buf) - conn->len);
-        if (n < 0)
+        if (n < 0) {
+            /* 타임아웃: 받은 게 없으면 조용히 닫고, 보내다 멈췄으면 408 (Slowloris 방어) */
+            if (is_timeout_errno(errno))
+                return conn->len == 0 ? HTTP_READ_TIMEOUT : 408;
             return HTTP_READ_IO_ERROR;
+        }
         if (n == 0)
             return conn->len == 0 ? HTTP_READ_EOF : 400;   /* 헤더 도중 끊김 */
         conn->len += (size_t)n;
