@@ -6,4 +6,5 @@ webserver_tsan
 tests/test_http
 tests/test_static
 tests/test_dynamic
+tests/test_timer
 *.dSYM/

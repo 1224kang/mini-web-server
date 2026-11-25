@@ -1,6 +1,6 @@
 # mini-web-server
 
-정글 13기 13주차 13팀의 C/POSIX 웹 서버입니다. accept 전용 스레드 1개와 `poll` 이벤트 루프 스레드 N개(기본 CPU 코어 수)로 HTTP 요청, 정적 파일, CGI, 내장 핸들러, 리버스 프록시를 처리합니다.
+정글 13기 13주차 13팀의 C/POSIX 웹 서버입니다. accept 전용 스레드 1개와 이벤트 루프 스레드 N개(기본 CPU 코어 수, Linux는 `epoll`·macOS는 `kqueue`)로 HTTP 요청, 정적 파일, CGI, 내장 핸들러, 리버스 프록시를 처리합니다.
 
 ## 기존 PR 비교
 
@@ -42,6 +42,40 @@ poll(listen, stop)                        poll([wake, stop, 자식회수, 자기
 - fd를 만든 뒤 `FD_CLOEXEC`를 켜기 전에 다른 스레드가 CGI를 `fork`하면 그 fd가 자식에게 샙니다. `accept`, 백엔드 `socket`, CGI의 `pipe`+`fork`는 같은 잠금(`cgi_fd_guard`) 안에서 합니다.
 - 동시 연결 한도(`max_conns`)는 모든 루프를 합친 값입니다. 스레드 수는 설정 파일의 `workers`로 정하며, 생략하면 CPU 코어 수(최대 8)입니다.
 
+### 이벤트 백엔드 (poller)
+
+루프는 `poll`을 직접 부르지 않고 `event.h`의 poller에 fd를 **등록**해 둡니다. 백엔드는 실행할 때 고르며, 시작 로그에 `kqueue backend`처럼 표시됩니다.
+
+| 백엔드 | 파일 | OS | 기다릴 때 비용 |
+|---|---|---|---|
+| `poll` | `event_poll.c` | 모두 | 등록된 fd 전체를 매번 커널에 넘기고 훑음: O(등록된 fd 수) |
+| `epoll` | `event_epoll.c` | Linux | 커널이 등록을 들고 있고 준비된 fd만 돌려줌: O(준비된 fd 수) |
+| `kqueue` | `event_kqueue.c` | macOS, BSD | epoll과 같음 |
+
+| 함수 | 하는 일 |
+|---|---|
+| `poller_add` / `poller_mod` / `poller_del` | fd를 감시 목록에 넣기 / 기다리는 이벤트 바꾸기 / 빼기 |
+| `poller_wait` | 준비된 fd와 등록할 때 넘긴 `ptr`을 돌려줌 (level-triggered) |
+
+- 연결이 기다리는 fd가 바뀔 수 있는 때는 그 연결을 건드린 직후뿐입니다(`conn_new`, `conn_handle`, `conn_timeout`, `conn_shutdown`). 루프는 그때만 `watch_sync`로 `conn_pollfds` 결과와 등록을 비교해 바뀐 것만 알립니다.
+- 이벤트의 `ptr`이 연결(`struct watch`)을 가리키므로, 이벤트가 온 연결을 배열을 훑지 않고 바로 찾습니다.
+- `conn.c`는 감시 중인 fd를 닫기 직전에 훅(`conn_set_close_hook`)을 부릅니다. epoll/kqueue는 등록을 커널이 들고 있어서, 루프 모르게 fd를 닫고 같은 번호로 새 fd를 열면(예: 프록시 재시도) 새 fd가 등록되지 않습니다. 또 epoll은 `fork`로 자식이 같은 파일을 들고 있으면 `close` 뒤에도 등록이 남습니다. 훅에서 등록을 먼저 지워 두 문제를 막습니다.
+- 백엔드별 차이: kqueue는 읽기와 쓰기를 따로 알려 주므로 한 fd의 결과가 두 번 올 수 있고(루프가 합침), 기다리는 이벤트가 없는(events=0) fd의 끊김은 알려 주지 않습니다. macOS에서는 `poll`도 이 경우를 알려 주지 않아 동작 차이는 없었습니다.
+
+### 타이머 힙과 한 바퀴의 비용
+
+연결의 마감(`conn_deadline`)은 루프마다 하나 있는 최소 힙(`timer.h`)에 둡니다. 힙 노드는 연결(`struct watch`) 안에 있고 자기 위치를 알고 있어서, 마감이 바뀌면 그 자리에서 옮기고 연결이 끝나면 바로 뺍니다.
+
+| 루프가 하는 일 | 예전 | 지금 (epoll/kqueue) |
+|---|---|---|
+| 기다리기 | `poll`에 전체 목록 전달 | 준비된 fd만 돌려받음 |
+| 얼마나 잘지 정하기 | 모든 연결의 마감 비교 | 힙 맨 위 하나 |
+| 일이 생긴 연결 찾기 | 모든 연결의 `revents` 확인 | 이벤트의 `ptr`로 바로 |
+| 마감 지난 연결 찾기 | 모든 연결의 마감 확인 | 힙 맨 위에서 지난 것만 꺼냄 |
+| 끝난 연결 정리 | 모든 연결의 `conn_done` 확인 | 이번 바퀴에 건드린 연결 중 끝난 것만 |
+
+연결의 등록·마감·종료 여부가 바뀌는 때는 그 연결을 건드린 직후뿐이므로, 루프는 그때 `watch_touched` 한 곳에서 셋을 함께 맞춥니다. 그래서 한 바퀴의 일은 열린 연결 수가 아니라 일이 생긴 연결 수에 비례합니다(마감 처리는 연결당 O(log n)). 종료 신호를 받았을 때만 모든 연결을 한 번 훑습니다.
+
 ## 서버 구성
 
 ```mermaid
@@ -59,7 +93,7 @@ flowchart LR
     N <-->|"HTTP/1.1"| A["라운드 로빈 백엔드"]
 ```
 
-1. `main.c`가 포트·문서 루트와 설정을 읽고 리스닝 소켓을 엽니다. `server.c`의 acceptor가 연결을 받아 이벤트 루프 스레드에 넘기고, 각 루프는 자기 연결의 fd, 종료 신호, CGI 자식 종료를 `poll`로 감시합니다.
+1. `main.c`가 포트·문서 루트와 설정을 읽고 리스닝 소켓을 엽니다. `server.c`의 acceptor가 연결을 받아 이벤트 루프 스레드에 넘기고, 각 루프는 자기 연결의 fd, 종료 신호, CGI 자식 종료를 poller(`event.h`, 지금은 `poll` 백엔드)로 감시합니다.
 2. `http.c`가 요청 헤더를 파싱하고, `conn.c`가 필요한 본문을 읽습니다. 요청을 받은 뒤 **프록시 규칙 → `/cgi-bin/` → `/builtin/` → 정적 파일** 순서로 처리합니다.
 3. 정적 파일은 작은 조각으로 읽어 보냅니다. CGI는 자식의 stdin과 stdout을 동시에 감시하고, 출력으로 HTTP 응답을 구성한 뒤 자식을 회수합니다.
 4. 프록시는 가장 긴 경로 접두사의 백엔드 중 하나를 라운드 로빈으로 선택합니다. 연결에 실패한 백엔드는 잠시 건너뛰고 다른 백엔드로 재시도합니다([백엔드 장애 조치](#백엔드-장애-조치)). 백엔드에는 요청마다 HTTP/1.1 연결을 사용하며, 응답 헤더를 확인한 뒤 본문을 스트리밍합니다. 클라이언트 쪽은 응답 경계가 명확하면 keep-alive를 유지할 수 있습니다.
@@ -118,6 +152,7 @@ make run PORT=8080
 | 설정 | 기본값 | 동작 |
 |---|---:|---|
 | `workers` | CPU 코어 수(최대 8) | 이벤트 루프 스레드 수 (1~64) |
+| `event_backend` | `auto` | `auto`(Linux `epoll`, macOS `kqueue`), `poll`, `epoll`, `kqueue`. 환경변수 `WEBSERVER_EVENT_BACKEND`가 있으면 설정보다 우선합니다. |
 | `keepalive_timeout_ms` | 5000 | 첫 요청 또는 다음 요청의 첫 바이트를 기다리는 시간 |
 | `header_timeout_ms` | 10000 | 첫 바이트부터 헤더 전체를 받기까지의 시간 |
 | `body_timeout_ms` | 30000 | 헤더를 파싱한 뒤 본문 전체를 받기까지의 시간 |
@@ -133,6 +168,105 @@ make test
 make smoke smoke-dynamic smoke-concurrency
 make asan test-asan
 WEBSERVER=./webserver_asan make smoke-dynamic
+# 같은 테스트를 poll 백엔드로
+WEBSERVER_EVENT_BACKEND=poll make smoke smoke-dynamic smoke-concurrency
 ```
 
 동적 스모크는 20 MiB 응답 중계, 백엔드 전송 완료 전 첫 본문 수신, 느린 클라이언트가 있는 동안의 정적 응답, 고정 길이·`chunked`·EOF 경계, 잘린 응답, 설정으로 바뀐 타임아웃을 확인합니다. 요청 쪽은 chunked 본문(잘게 나눈 전송, 파이프라이닝, CGI·프록시 전달)과 TE·CL 충돌, 지원하지 않는 코딩, 형식 오류, 한도 초과를 확인합니다. 기존 CGI·정적 파일·keep-alive·라운드 로빈 테스트도 함께 실행합니다.
+
+## 성능 측정
+
+이벤트 백엔드를 `poll`에서 epoll/kqueue로 바꾸고 루프를 정리한 효과를 잰 결과입니다.
+
+### 핵심 숫자
+
+노는 keep-alive 연결 9,000개가 붙어 있는 상태, 이벤트 루프 1개 기준:
+
+| | 기존 develop | 새 루프 + kqueue |
+|---|---:|---:|
+| 초당 처리 요청 수 | 13,536 | **41,667** (약 3.1배) |
+| 노는 연결 0개 대비 처리량 | −68% | **−3%** |
+| p99 지연 | 7 ms | **3 ms** |
+| 실패한 요청 | 0 | 0 |
+
+### 무엇을 측정했나
+
+`bench/bench.py`가 측정 한 번마다 다음을 자동으로 합니다.
+
+1. 테스트용 설정으로 서버를 띄웁니다. 실험 1은 `workers 1`(루프 하나가 모든 연결을 맡아 차이가 그대로 드러나게)이고, 노는 연결이 도중에 끊기지 않게 `keepalive_timeout_ms 600000`을 씁니다. 백엔드는 환경변수 `WEBSERVER_EVENT_BACKEND`로 고릅니다.
+2. TCP 연결 N개를 열고 아무 요청도 보내지 않은 채 들고 있습니다(노는 keep-alive 사용자).
+3. 노는 연결이 모두 열려 있는지 확인합니다. 서버가 거절하거나 끊었으면 측정을 멈춥니다.
+4. `ab`로 1초 동안 데운 뒤, `ab -k -c 50 -t 8`로 연결 50개를 keep-alive로 유지하며 8초 동안 `GET /index.html`(1,438바이트 정적 파일)을 반복 요청합니다.
+5. 초당 처리 요청 수, 50%·99% 지연, 실패 수를 기록하고, 노는 연결을 RST로 끊은 뒤(TIME_WAIT가 남지 않게) 서버를 종료합니다.
+6. 1~5를 3번 반복해 중앙값을 씁니다.
+
+| 비교 대상 | 내용 |
+|---|---|
+| 기존 develop | 이벤트 백엔드 작업 전 커밋 `5bae131`. 매 바퀴 모든 연결의 `pollfd`를 다시 만들고 `poll` |
+| 새 루프 + poll | 등록 방식 루프와 타이머 힙, 커널 대기는 `poll` |
+| 새 루프 + kqueue | 등록 방식 루프와 타이머 힙, 커널 대기는 kqueue (Linux에서는 epoll) |
+
+측정 환경: Apple M5(10코어) MacBook, macOS. 서버와 부하 도구(`ab`)가 같은 컴퓨터(127.0.0.1)에서 동작합니다.
+
+### 실험 1: 노는 연결이 늘어도 처리량이 유지되는가
+
+루프 1개에 노는 연결을 0~9,000개 붙여 두고, 활성 연결 50개의 처리량을 쟀습니다.
+
+![노는 연결 수에 따른 처리량](bench/results/macos-idle.svg)
+
+| 노는 연결 수 | 기존 develop | 새 루프 + poll | 새 루프 + kqueue |
+|---:|---:|---:|---:|
+| 0 | 42,233 | 42,176 | 43,012 |
+| 1,000 | 36,788 | 37,063 | 43,009 |
+| 2,500 | 27,033 | 27,984 | 42,614 |
+| 5,000 | 20,449 | 20,827 | 42,043 |
+| 9,000 | 13,536 (−68%) | 14,135 (−66%) | 41,667 (−3%) |
+| p99 지연 (9,000개) | 7 ms | 7 ms | 3 ms |
+
+(초당 처리 요청 수, 8초 × 3회의 중앙값. 괄호는 노는 연결 0개 대비 변화. 모든 측정에서 실패 0건)
+
+### 실험 2: 이벤트 루프를 늘리면 처리량이 느는가
+
+노는 연결 없이 `workers`를 1, 2, 4, 8로 바꿨습니다. `ab` 하나는 코어 하나만 쓰므로 4개를 동시에 띄워 처리량을 합쳤습니다(각각 `-c 50`).
+
+![루프 수에 따른 처리량](bench/results/macos-workers.svg)
+
+| 루프 수 | 기존 develop | 새 루프 + kqueue |
+|---:|---:|---:|
+| 1 | 41,924 | 43,002 |
+| 2 | 65,735 | 67,826 |
+| 4 | 60,343 | 61,703 |
+| 8 | 58,441 | 58,594 |
+
+### 결론
+
+1. **노는 연결이 많아져도 처리량이 유지됩니다.** 노는 연결 9,000개에서 기존 서버는 처리량이 68% 줄었지만, kqueue 서버는 3% 줄었습니다. 같은 조건에서 약 3.1배를 처리하고 p99 지연도 7 ms에서 3 ms로 줄었습니다.
+2. **차이를 만든 것은 커널 대기 방식입니다.** `poll`은 기다릴 때마다 등록된 fd 전체를 커널에 넘기고 훑으므로 연결 수에 비례해 느려집니다. kqueue/epoll은 준비된 fd만 돌려받습니다. 새 루프를 `poll`로 돌리면 기존과 거의 같으므로, 루프 정리(등록 방식·타이머 힙)는 그 자체로 빨라진 것이 아니라 kqueue/epoll의 효과가 나도록 "매 바퀴 모든 연결 훑기"를 없앤 기반 작업입니다.
+3. **노는 연결이 없으면 기존과 같습니다.** 실험 2에서 두 서버의 차이는 3% 안쪽입니다. 이번 변경은 평소 성능을 해치지 않고, 대기 연결이 많은 상황(실제 서비스의 keep-alive 사용자)에서 효과를 냅니다.
+4. **루프 수 확장은 이 환경에서 결론을 내기 어렵습니다.** 루프 2개에서 약 1.6배가 되었지만 4개 이상은 늘지 않았습니다. 서버와 `ab` 4개가 같은 컴퓨터의 코어 10개를 나눠 쓰므로 부하 도구가 한계였을 가능성이 큽니다. 확장성을 제대로 보려면 부하 도구를 다른 컴퓨터에서 돌려야 합니다.
+
+측정의 한계: `ab`는 지연을 ms 정수로만 보여 주고, HTTP/1.0 keep-alive로 요청합니다. macOS의 임시 포트가 약 16,000개라 노는 연결은 9,000개까지 측정했습니다. 서버의 동시 연결 한도(`max_conns`)는 최대 10,000입니다.
+
+### 다시 측정하기 (Linux/WSL)
+
+Linux에서는 `kqueue` 대신 `epoll`을 씁니다. 저장소 폴더에서 차례로 실행합니다.
+
+```sh
+sudo apt install -y apache2-utils                       # ab
+make                                                     # 새 서버
+git worktree add ../before 5bae131 && make -C ../before webserver   # 비교용 기존 서버
+
+# 실험 1 (약 12분)
+python3 bench/bench.py idle --series before=../before/webserver: \
+    --series poll=./webserver:poll --series epoll=./webserver:epoll --csv bench/results/linux-idle.csv
+# 실험 2 (약 6분)
+python3 bench/bench.py workers --series before=../before/webserver: \
+    --series epoll=./webserver:epoll --csv bench/results/linux-workers.csv
+# 그래프
+python3 bench/plot.py bench/results/linux-idle.csv bench/results/linux-idle.svg
+python3 bench/plot.py bench/results/linux-workers.csv bench/results/linux-workers.svg
+```
+
+- `--series 이름=실행파일:백엔드` 형식입니다. 백엔드 칸을 비우면 그 서버의 기본 방식으로 돕니다(기존 코드는 `poll`).
+- 측정 중에는 다른 무거운 프로그램을 끄고, 측정을 두 개 동시에 돌리지 않습니다(둘 다 18400번 포트, 바꾸려면 `BENCH_PORT`).
+- 컴퓨터마다 숫자 자체는 다릅니다. 노는 연결이 늘 때 기존 서버와 `poll`은 떨어지고 epoll은 유지되는지, 추세를 비교합니다.
