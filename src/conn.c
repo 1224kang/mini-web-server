@@ -50,6 +50,12 @@ enum conn_state {
  * "어디까지 했는지"를 전부 여기 적어 둬야 한다. 이게 상태 머신이다. */
 enum up_kind { UP_NONE, UP_CGI, UP_PROXY };
 
+/* 프록시는 ST_UPSTREAM 안에서 다시 세 단계를 차례로 거친다. 단계마다 기다리는 신호가 다르다.
+ *   PX_CONNECTING : non-blocking connect 결과를 기다림   (POLLOUT → SO_ERROR 확인)
+ *   PX_SENDING    : 다시 쓴 요청을 백엔드에 보내는 중      (POLLOUT)
+ *   PX_RECEIVING  : 백엔드 응답을 EOF 까지 모으는 중       (POLLIN) */
+enum proxy_step { PX_NONE, PX_CONNECTING, PX_SENDING, PX_RECEIVING };
+
 struct conn {
     int fd;
     unsigned long id;
@@ -89,7 +95,7 @@ struct conn {
     enum up_kind up_kind;
     pid_t cgi_pid;          /* 아직 cgi_release 하지 않은 자식 (0 이면 없음) */
     int up_in_fd, up_out_fd;
-    int up_connecting;      /* 프록시: non-blocking connect 가 아직 진행 중 */
+    enum proxy_step px_step; /* 프록시: 지금 몇 번째 단계인지 (CGI 는 PX_NONE) */
     const char *up_send;    /* 업스트림에 보낼 것 (CGI: 요청 본문, 프록시: 다시 쓴 요청) */
     size_t up_send_len, up_send_sent;
     char *up_req;           /* 프록시: 다시 쓴 요청 (up_send 가 가리킴, 우리가 해제) */
@@ -149,7 +155,7 @@ static void release_upstream(struct conn *c)
     c->up_req = c->up_buf = NULL;
     c->up_send = NULL;
     c->up_send_len = c->up_send_sent = c->up_len = c->up_cap = 0;
-    c->up_connecting = 0;
+    c->px_step = PX_NONE;
     c->up_kind = UP_NONE;
 }
 
@@ -171,9 +177,18 @@ static void release_response(struct conn *c)
     c->body_len = c->body_have = 0;
 }
 
+/* 상태를 바꾸는 유일한 곳. 상태가 바뀌면 그 상태의 마감 시각도 반드시 같이 정한다.
+ * (`grep set_state` 로 모든 상태 전이를 한눈에 볼 수 있다.)
+ * 같은 상태 안에서 마감만 늦추는 경우(조금이라도 보냈다, 첫 바이트가 왔다)는 c->deadline 을 직접 고친다. */
+static void set_state(struct conn *c, enum conn_state st, long long deadline)
+{
+    c->state = st;
+    c->deadline = deadline;
+}
+
 static void close_now(struct conn *c)
 {
-    c->state = ST_DONE;
+    set_state(c, ST_DONE, LLONG_MAX);
 }
 
 /* 안 읽은 데이터가 남은 채 close 하면 커널이 RST 를 보내 클라이언트가 응답을 못 읽을 수 있다.
@@ -182,19 +197,17 @@ static void close_now(struct conn *c)
 static void start_linger(struct conn *c, long long now)
 {
     shutdown(c->fd, SHUT_WR);
-    c->state = ST_LINGER;
     c->drained = 0;
-    c->deadline = now + LINGER_TIMEOUT_MS;
+    set_state(c, ST_LINGER, now + LINGER_TIMEOUT_MS);
 }
 
 /* 다음 요청을 받을 준비. 버퍼에 이미 다음 요청 일부가 있으면(파이프라이닝) 헤더 마감을,
  * 없으면 idle 마감을 건다. 파싱은 여기서 하지 않는다 → conn_handle 의 pump 가 한다. */
 static void enter_read_head(struct conn *c, long long now)
 {
-    c->state = ST_READ_HEAD;
     c->scanned = 0;
     c->head_only = 0;
-    c->deadline = now + (c->len > 0 ? HEADER_TIMEOUT_MS : IDLE_TIMEOUT_MS);
+    set_state(c, ST_READ_HEAD, now + (c->len > 0 ? HEADER_TIMEOUT_MS : IDLE_TIMEOUT_MS));
 }
 
 /* 응답을 다 보냈다. keep-alive 면 같은 연결로 다음 요청, 아니면 닫기. */
@@ -285,6 +298,15 @@ static void do_write(struct conn *c, long long now)
     /* 예산을 다 씀 → 다른 연결 차례. 아직 WRITE 상태라 다음 바퀴에 POLLOUT 으로 다시 온다. */
 }
 
+/* out(+file_fd) 에 보낼 것을 다 채운 뒤 부른다: WRITE 상태로 바꾸고 바로 보내기 시작.
+ * 대부분은 송신 버퍼에 바로 들어가므로 POLLOUT 을 기다리지 않고 먼저 시도한다. */
+static void start_write(struct conn *c, long long now)
+{
+    c->out_sent = 0;
+    set_state(c, ST_WRITE, now + SEND_TIMEOUT_MS);
+    do_write(c, now);
+}
+
 /* 헤더 + 본문을 한 덩어리로 만들어 보내기 시작한다. */
 static void begin_response(struct conn *c, int status, const char *content_type,
                            const char *body, size_t body_len, const char *extra_headers,
@@ -303,13 +325,9 @@ static void begin_response(struct conn *c, int status, const char *content_type,
     if (send_body > 0)
         memcpy(c->out + n, body, send_body);
     c->out_len = (size_t)n + send_body;
-    c->out_sent = 0;
     snprintf(c->summary, sizeof(c->summary), "<- %d %s (%zu bytes body)", status,
              http_reason(status), body_len);
-
-    c->state = ST_WRITE;
-    c->deadline = now + SEND_TIMEOUT_MS;
-    do_write(c, now); /* 대부분은 송신 버퍼에 바로 들어가므로 POLLOUT 을 기다리지 않고 시도 */
+    start_write(c, now);
 }
 
 /* 에러 응답: 본문은 "404 Not Found\n" 처럼 상태를 그대로 적는다. */
@@ -437,7 +455,6 @@ static void serve_file(struct conn *c, int head_only, long long now)
     }
     memcpy(c->out, head, (size_t)n);
     c->out_len = (size_t)n;
-    c->out_sent = 0;
     if (head_only) {
         close(file_fd);
     } else {
@@ -446,10 +463,7 @@ static void serve_file(struct conn *c, int head_only, long long now)
     }
     snprintf(c->summary, sizeof(c->summary), "<- 200 OK %s (%lld bytes%s)", real,
              (long long)st.st_size, head_only ? ", HEAD" : "");
-
-    c->state = ST_WRITE;
-    c->deadline = now + SEND_TIMEOUT_MS;
-    do_write(c, now);
+    start_write(c, now);
 }
 
 /* ------------------------------------------------------------------ */
@@ -508,10 +522,7 @@ static void upstream_complete(struct conn *c, long long now)
 
     c->out = out;
     c->out_len = out_len;
-    c->out_sent = 0;
-    c->state = ST_WRITE;
-    c->deadline = now + SEND_TIMEOUT_MS;
-    do_write(c, now);
+    start_write(c, now);
 }
 
 /* 업스트림 출력을 "한 번" 읽는다. 더 있으면 poll 이 또 알려 준다. */
@@ -570,8 +581,9 @@ static void upstream_write(struct conn *c, long long now)
     if (c->up_kind == UP_CGI) {
         close(c->up_in_fd);
         c->up_in_fd = -1;
+    } else {
+        c->px_step = PX_RECEIVING; /* 이제 conn_pollfds 가 POLLOUT 대신 POLLIN 을 건다 */
     }
-    /* 프록시: 다 보냈으니 이제 conn_pollfds 가 POLLOUT 대신 POLLIN 을 건다 */
 }
 
 /* ------------------------------------------------------------------ */
@@ -668,8 +680,7 @@ static void start_cgi(struct conn *c, long long now)
     c->up_send_len = c->body_len;
     c->up_send_sent = 0;
     snprintf(c->up_name, sizeof(c->up_name), "%s", script_name);
-    c->state = ST_UPSTREAM;
-    c->deadline = now + c->cfg->cgi_timeout_ms; /* 실행 전체에 대한 마감 */
+    set_state(c, ST_UPSTREAM, now + c->cfg->cgi_timeout_ms); /* 실행 전체에 대한 마감 */
     conn_log(c, "cgi %s started (pid %d, %zu bytes to stdin)", script_name, (int)pid, c->body_len);
     upstream_write(c, now); /* 본문이 없으면 바로 stdin 을 닫는다 */
 }
@@ -703,43 +714,51 @@ static void start_proxy(struct conn *c, struct proxy_route *route, long long now
     fcntl(fd, F_SETFD, FD_CLOEXEC);
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     c->up_out_fd = fd;
-    c->state = ST_UPSTREAM;
     conn_log(c, "proxy %s %s -> %s (route %s)", c->req.method, c->req.target, b->name,
              route->prefix);
 
     /* non-blocking connect: 바로 끝나지 않으면 EINPROGRESS 를 돌려주고, 연결이 되든 실패하든
      * 소켓이 "쓸 수 있음(POLLOUT)"이 된다. 결과는 그때 SO_ERROR 로 확인한다. */
     if (connect(fd, (const struct sockaddr *)&b->addr, sizeof(b->addr)) == 0) {
-        c->deadline = now + c->cfg->proxy_timeout_ms;
+        c->px_step = PX_SENDING; /* 로컬 백엔드면 바로 연결될 수도 있다 */
+        set_state(c, ST_UPSTREAM, now + c->cfg->proxy_timeout_ms);
         upstream_write(c, now);
     } else if (errno == EINPROGRESS) {
-        c->up_connecting = 1;
-        c->deadline = now + c->cfg->proxy_connect_timeout_ms;
+        c->px_step = PX_CONNECTING;
+        set_state(c, ST_UPSTREAM, now + c->cfg->proxy_connect_timeout_ms);
     } else {
         upstream_fail(c, 502, strerror(errno), now); /* 보통 ECONNREFUSED: 백엔드가 죽어 있다 */
     }
 }
 
-static void proxy_io(struct conn *c, short revents, long long now)
+/* PX_CONNECTING 에서 POLLOUT 이 왔다 = connect 가 끝났다(성공이든 실패든). SO_ERROR 로 결과 확인. */
+static void proxy_check_connect(struct conn *c, long long now)
 {
-    if (c->up_connecting) {
-        int err = 0;
-        socklen_t len = sizeof(err);
-        if (getsockopt(c->up_out_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
-            err = errno;
-        if (err) {
-            upstream_fail(c, 502, strerror(err), now);
-            return;
-        }
-        c->up_connecting = 0;
-        c->deadline = now + c->cfg->proxy_timeout_ms;
-    }
-    if (c->up_send_sent < c->up_send_len) {
-        upstream_write(c, now);
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(c->up_out_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+        err = errno;
+    if (err) {
+        upstream_fail(c, 502, strerror(err), now);
         return;
     }
-    if (revents & (POLLIN | POLLHUP | POLLERR))
-        upstream_read(c, now);
+    c->px_step = PX_SENDING;
+    c->deadline = now + c->cfg->proxy_timeout_ms; /* 여기부터는 "응답 대기" 마감 */
+    upstream_write(c, now);
+}
+
+/* 백엔드 소켓에 신호가 왔다. 지금 단계가 할 일 하나만 한다. */
+static void proxy_io(struct conn *c, short revents, long long now)
+{
+    switch (c->px_step) {
+    case PX_CONNECTING: proxy_check_connect(c, now); break; /* 다 되면 → PX_SENDING */
+    case PX_SENDING:    upstream_write(c, now);      break; /* 다 보내면 → PX_RECEIVING */
+    case PX_RECEIVING:                                      /* EOF 면 → upstream_complete */
+        if (revents & (POLLIN | POLLHUP | POLLERR))
+            upstream_read(c, now);
+        break;
+    case PX_NONE:       break;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -824,9 +843,8 @@ static void process_head(struct conn *c, size_t head_len, long long now)
         c->body_have = in_buf;
         memcpy(c->body, c->buf + head_len, in_buf);
         if (c->body_have < clen) {
-            c->state = ST_READ_BODY;
-            c->deadline = now + BODY_TIMEOUT_MS;
-            return; /* 나머지는 POLLIN 이 올 때마다 do_read 가 채운다 */
+            set_state(c, ST_READ_BODY, now + BODY_TIMEOUT_MS);
+            return; /* 나머지는 POLLIN 이 올 때마다 on_read_body 가 채운다 */
         }
     }
     dispatch(c, now);
@@ -847,57 +865,95 @@ static void try_head(struct conn *c, long long now)
         fail(c, 431, now); /* 버퍼가 꽉 찼는데도 헤더 끝이 없음 */
 }
 
-/* 읽을 게 있다는 신호가 왔다. recv 를 "한 번만" 하고 돌아간다.
- * (더 남아 있으면 poll 이 다음 바퀴에 또 알려 준다: level-triggered) */
-static void do_read(struct conn *c, long long now)
+/* 클라이언트 소켓에서 recv 를 "한 번만" 한다. (더 남아 있으면 poll 이 다음 바퀴에 또 알려 준다)
+ *   > 0 : 받은 바이트 수
+ *     0 : 상대가 닫았거나 에러 → 이미 close_now 했음
+ *    -1 : 지금은 받을 게 없음(EAGAIN) → 다음 POLLIN 을 기다리면 됨 */
+static ssize_t recv_or_close(struct conn *c, void *dst, size_t room)
 {
-    char sink[4096];
-    char *dst;
-    size_t room;
-
-    switch (c->state) {
-    case ST_READ_HEAD: dst = c->buf + c->len;           room = sizeof(c->buf) - c->len;  break;
-    case ST_READ_BODY: dst = c->body + c->body_have;    room = c->body_len - c->body_have; break;
-    case ST_LINGER:    dst = sink;                      room = sizeof(sink);             break;
-    default:           return;
-    }
-
     ssize_t n = recv(c->fd, dst, room, 0);
-    if (n < 0) {
-        if (would_block())
-            return;
-        if (errno != ECONNRESET && c->state != ST_LINGER)
-            conn_log_errno(c, "recv");
-        close_now(c);
-        return;
-    }
-    if (n == 0) { /* 상대가 닫음 */
-        if (c->state == ST_READ_BODY)
-            conn_log(c, "client closed before sending full body (%zu/%zu)", c->body_have,
-                     c->body_len);
-        close_now(c);
-        return;
-    }
+    if (n > 0)
+        return n;
+    if (n < 0 && would_block())
+        return -1;
+    if (n < 0 && errno != ECONNRESET && c->state != ST_LINGER)
+        conn_log_errno(c, "recv");
+    close_now(c);
+    return 0;
+}
 
-    switch (c->state) {
-    case ST_READ_HEAD:
-        if (c->len == 0)
-            c->deadline = now + HEADER_TIMEOUT_MS; /* 첫 바이트: 여기서부터 헤더 마감 시작 */
-        c->len += (size_t)n; /* 파싱은 pump 가 */
-        break;
-    case ST_READ_BODY:
-        c->body_have += (size_t)n;
-        if (c->body_have == c->body_len)
-            dispatch(c, now);
-        break;
-    case ST_LINGER:
-        c->drained += (size_t)n;
-        if (c->drained >= LINGER_MAX_BYTES)
-            close_now(c);
-        break;
-    default:
-        break;
+/* ---- 상태마다 함수 하나: conn_handle 이 지금 상태에 맞는 것 하나만 부른다 ---- */
+
+/* ST_READ_HEAD: 받아서 buf 에 쌓기만 한다. "\r\n\r\n" 찾기와 파싱은 pump → try_head 가 한다. */
+static void on_read_head(struct conn *c, short revents, long long now)
+{
+    if (!(revents & (POLLIN | POLLHUP | POLLERR)))
+        return;
+    ssize_t n = recv_or_close(c, c->buf + c->len, sizeof(c->buf) - c->len);
+    if (n <= 0)
+        return;
+    if (c->len == 0)
+        c->deadline = now + HEADER_TIMEOUT_MS; /* 첫 바이트: 여기서부터 헤더 마감 시작 */
+    c->len += (size_t)n;
+}
+
+/* ST_READ_BODY: Content-Length 만큼 body 에 채운다. 다 차면 어디로 보낼지 정한다. */
+static void on_read_body(struct conn *c, short revents, long long now)
+{
+    if (!(revents & (POLLIN | POLLHUP | POLLERR)))
+        return;
+    ssize_t n = recv_or_close(c, c->body + c->body_have, c->body_len - c->body_have);
+    if (n == 0)
+        conn_log(c, "client closed before sending full body (%zu/%zu)", c->body_have, c->body_len);
+    if (n <= 0)
+        return;
+    c->body_have += (size_t)n;
+    if (c->body_have == c->body_len)
+        dispatch(c, now); /* → 프록시 / CGI 면 ST_UPSTREAM, 나머지는 ST_WRITE */
+}
+
+/* ST_UPSTREAM: 클라이언트 소켓은 기다리지 않고, CGI 파이프나 백엔드 소켓의 신호를 처리한다. */
+static void on_upstream(struct conn *c, const struct pollfd *pfds, int n, long long now)
+{
+    if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        /* events=0 이어도 이 셋은 보고된다. 무시하면 poll 이 매번 즉시 돌아와 헛돈다. */
+        conn_log(c, "client went away while waiting for %s", up_label(c));
+        release_upstream(c);
+        close_now(c);
+        return;
     }
+    for (int i = 1; i < n && c->state == ST_UPSTREAM; i++) {
+        if (!pfds[i].revents)
+            continue;
+        if (pfds[i].fd == c->up_in_fd)
+            upstream_write(c, now);                 /* CGI stdin: 본문 쓰기 */
+        else if (pfds[i].fd == c->up_out_fd && c->up_kind == UP_PROXY)
+            proxy_io(c, pfds[i].revents, now);      /* 백엔드 소켓: 단계별로 */
+        else if (pfds[i].fd == c->up_out_fd)
+            upstream_read(c, now);                  /* CGI stdout: 출력 모으기 */
+    }
+}
+
+/* ST_WRITE: 보낼 수 있는 만큼 보낸다. 다 보내면 do_write 가 finish_response 를 부른다.
+ * POLLHUP/POLLERR 도 같이 처리한다: 이어지는 send 가 -1 로 이유를 알려 준다. */
+static void on_write(struct conn *c, short revents, long long now)
+{
+    if (revents & (POLLOUT | POLLHUP | POLLERR))
+        do_write(c, now);
+}
+
+/* ST_LINGER: 남은 입력을 읽어서 버린다. 상대가 닫거나(recv 0) 너무 많이 오면 끝. */
+static void on_linger(struct conn *c, short revents)
+{
+    if (!(revents & (POLLIN | POLLHUP | POLLERR)))
+        return;
+    char sink[4096];
+    ssize_t n = recv_or_close(c, sink, sizeof(sink));
+    if (n <= 0)
+        return;
+    c->drained += (size_t)n;
+    if (c->drained >= LINGER_MAX_BYTES)
+        close_now(c);
 }
 
 /* 소켓을 기다리지 않고도 진행할 수 있는 동안 계속 진행한다.
@@ -953,8 +1009,8 @@ int conn_pollfds(const struct conn *c, struct pollfd *out)
         if (c->up_in_fd >= 0)
             out[n++] = (struct pollfd){ .fd = c->up_in_fd, .events = POLLOUT };
         if (c->up_out_fd >= 0) {
-            short ev = POLLIN;
-            if (c->up_kind == UP_PROXY && (c->up_connecting || c->up_send_sent < c->up_send_len))
+            short ev = POLLIN; /* CGI stdout, 또는 프록시 PX_RECEIVING */
+            if (c->px_step == PX_CONNECTING || c->px_step == PX_SENDING)
                 ev = POLLOUT; /* 연결 완료 / 요청 보내기를 기다리는 중 */
             out[n++] = (struct pollfd){ .fd = c->up_out_fd, .events = ev };
         }
@@ -972,33 +1028,19 @@ int conn_done(const struct conn *c)
     return c->state == ST_DONE;
 }
 
+/* poll 이 이 연결의 fd 에 신호를 줬다. 지금 상태의 함수 하나만 부른다.
+ * 그 함수가 상태를 바꿨을 수 있으므로(예: 응답을 다 보내고 READ_HEAD 로), 마지막에 pump 가
+ * "기다리지 않고 더 할 수 있는 일"(buf 에 이미 와 있는 다음 요청 파싱)을 마저 한다. */
 void conn_handle(struct conn *c, const struct pollfd *pfds, int n, long long now)
 {
-    short revents = pfds[0].revents;
-    if (c->state == ST_UPSTREAM) {
-        if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            /* events=0 이어도 이 셋은 보고된다. 무시하면 poll 이 매번 즉시 돌아와 헛돈다. */
-            conn_log(c, "client went away while waiting for %s", up_label(c));
-            release_upstream(c);
-            close_now(c);
-            return;
-        }
-        for (int i = 1; i < n && c->state == ST_UPSTREAM; i++) {
-            if (!pfds[i].revents)
-                continue;
-            if (pfds[i].fd == c->up_in_fd)
-                upstream_write(c, now);
-            else if (pfds[i].fd == c->up_out_fd && c->up_kind == UP_PROXY)
-                proxy_io(c, pfds[i].revents, now);
-            else if (pfds[i].fd == c->up_out_fd)
-                upstream_read(c, now);
-        }
-    } else if (c->state == ST_WRITE) {
-        /* POLLHUP/POLLERR 도 같이 처리한다: 이어지는 recv/send 가 0 이나 -1 로 이유를 알려 준다. */
-        if (revents & (POLLOUT | POLLHUP | POLLERR))
-            do_write(c, now);
-    } else if (revents & (POLLIN | POLLHUP | POLLERR)) {
-        do_read(c, now);
+    short revents = pfds[0].revents; /* pfds[0] 은 항상 클라이언트 소켓 */
+    switch (c->state) {
+    case ST_READ_HEAD: on_read_head(c, revents, now);  break;
+    case ST_READ_BODY: on_read_body(c, revents, now);  break;
+    case ST_UPSTREAM:  on_upstream(c, pfds, n, now);   break;
+    case ST_WRITE:     on_write(c, revents, now);      break;
+    case ST_LINGER:    on_linger(c, revents);          break;
+    case ST_DONE:      break;
     }
     pump(c, now);
 }
@@ -1025,7 +1067,7 @@ void conn_timeout(struct conn *c, long long now)
         if (c->up_kind == UP_CGI)
             upstream_fail(c, 504, "timed out, killing", now);
         else
-            upstream_fail(c, 504, c->up_connecting ? "connect timed out" : "response timed out", now);
+            upstream_fail(c, 504, c->px_step == PX_CONNECTING ? "connect timed out" : "response timed out", now);
         break;
     case ST_WRITE:
         conn_log(c, "send timed out (client not reading)");
