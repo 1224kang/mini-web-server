@@ -1,5 +1,9 @@
 CC      := cc
 CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -g -pthread -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
+# macOS 는 _POSIX_C_SOURCE 를 정의하면 POSIX 밖의 이름(_SC_NPROCESSORS_ONLN 등)을 가린다
+ifeq ($(shell uname -s),Darwin)
+CFLAGS  += -D_DARWIN_C_SOURCE
+endif
 MODE    ?= release
 PORT    ?= 18080
 SRCS    := src/main.c src/server.c src/http.c src/static_files.c src/conn.c \
