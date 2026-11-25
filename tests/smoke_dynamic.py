@@ -302,6 +302,14 @@ def test_proxy(backends):
         seq.append(json.loads(b)["backend"] if st == 200 else st)
     names = [f"b{p}" for p in BACKEND_PORTS]
     check("Round-Robin: 3개에 번갈아 분배", seq == names * 2, seq)
+
+    # 이벤트 루프 여러 개가 동시에 백엔드를 골라도 카운터(atomic)가 겹치지 않는다
+    with concurrent.futures.ThreadPoolExecutor(30) as ex:
+        got = list(ex.map(lambda _: request("GET", "/api/rr-par"), range(60)))
+    picked = [json.loads(b)["backend"] for st, _, b, _ in got if st == 200]
+    counts = {n: picked.count(n) for n in names}
+    check("여러 루프에서 동시에 60개 → 백엔드마다 정확히 20개", len(picked) == 60 and
+          all(v == 20 for v in counts.values()), counts)
     test_proxy_stream()
     test_proxy_framing()
 
@@ -361,7 +369,8 @@ def main():
         sys.exit("build first: make")
     conf = os.path.join(TMP, "test.conf")
     with open(conf, "w") as f:
-        f.write(f"cgi_dir {os.path.join(REPO, 'cgi-bin')}\n"
+        f.write("workers 4\n"
+                f"cgi_dir {os.path.join(REPO, 'cgi-bin')}\n"
                 "cgi_timeout_ms 2000\n"
                 "keepalive_timeout_ms 600\n"
                 "header_timeout_ms 350\n"

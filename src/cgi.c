@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,8 +17,36 @@ static void set_cloexec_nonblock(int fd, int nonblock)
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 }
 
+static pthread_mutex_t fd_guard = PTHREAD_MUTEX_INITIALIZER;
+
+void cgi_fd_guard_enter(void)
+{
+    pthread_mutex_lock(&fd_guard);
+}
+
+void cgi_fd_guard_leave(void)
+{
+    pthread_mutex_unlock(&fd_guard);
+}
+
+static int spawn_locked(const char *script, const char *dir, char *const envp[], pid_t *pid,
+                        int *stdin_fd, int *stdout_fd);
+
 int cgi_spawn(const char *script, const char *dir, char *const envp[], pid_t *pid,
               int *stdin_fd, int *stdout_fd)
+{
+    /* 파이프를 만들고 FD_CLOEXEC 를 켜는 동안, 그리고 fork 하는 순간에 다른 스레드가
+     * FD_CLOEXEC 없는 fd 를 들고 있지 않도록 같은 잠금 안에서 한다. */
+    cgi_fd_guard_enter();
+    int rc = spawn_locked(script, dir, envp, pid, stdin_fd, stdout_fd);
+    int saved = errno;
+    cgi_fd_guard_leave();
+    errno = saved;
+    return rc;
+}
+
+static int spawn_locked(const char *script, const char *dir, char *const envp[], pid_t *pid,
+                        int *stdin_fd, int *stdout_fd)
 {
     int in[2], out[2]; /* [0] 읽는 쪽, [1] 쓰는 쪽 */
     if (pipe(in) < 0)
@@ -132,7 +161,9 @@ int cgi_reaper_fd(void)
     return reap_pipe[0];
 }
 
-/* 연결이 손을 뗀 자식들. 아직 안 끝났으면 SIGCHLD 가 올 때 여기서 거둔다. */
+/* 연결이 손을 뗀 자식들. 아직 안 끝났으면 SIGCHLD 가 올 때 여기서 거둔다.
+ * 여러 이벤트 루프 스레드가 넣고 거두므로 orphans_lock 으로 보호한다. */
+static pthread_mutex_t orphans_lock = PTHREAD_MUTEX_INITIALIZER;
 static pid_t *orphans;
 static size_t norphans, orphans_cap;
 
@@ -159,12 +190,18 @@ void cgi_release(pid_t pid, int kill_it)
      * 재사용될 수 없다 → kill 이 엉뚱한 프로세스를 죽일 위험이 없다. */
     if (kill_it)
         kill(-pid, SIGKILL); /* 음수 = 프로세스 그룹 전체 (자식 + 손자들) */
-    if (try_wait(pid))
+    /* "아직 안 끝남 확인 → 목록에 넣기"를 한 잠금 안에서 한다. 사이가 벌어지면 그 틈에
+     * 자식이 끝나고 다른 스레드의 cgi_reap 이 목록을 훑고 지나가, SIGCHLD 를 놓친다. */
+    pthread_mutex_lock(&orphans_lock);
+    if (try_wait(pid)) {
+        pthread_mutex_unlock(&orphans_lock);
         return;
+    }
     if (norphans == orphans_cap) {
         size_t cap = orphans_cap ? orphans_cap * 2 : 64;
         pid_t *np = realloc(orphans, cap * sizeof(*np));
         if (!np) {
+            pthread_mutex_unlock(&orphans_lock);
             fprintf(stderr, "[cgi] cannot track pid %d (it will stay a zombie)\n", (int)pid);
             return;
         }
@@ -172,6 +209,7 @@ void cgi_release(pid_t pid, int kill_it)
         orphans_cap = cap;
     }
     orphans[norphans++] = pid;
+    pthread_mutex_unlock(&orphans_lock);
 }
 
 int cgi_reap(void)
@@ -184,6 +222,7 @@ int cgi_reap(void)
      * waitpid(-1) 을 쓰지 않는 이유: 연결이 아직 쥐고 있는 자식까지 거둬 버리면, 그 pid 가
      * 재사용된 뒤 연결이 타임아웃으로 kill(pid) 할 때 남의 프로세스를 죽일 수 있다. */
     int n = 0;
+    pthread_mutex_lock(&orphans_lock);
     for (size_t i = 0; i < norphans;) {
         if (try_wait(orphans[i])) {
             orphans[i] = orphans[--norphans];
@@ -192,5 +231,6 @@ int cgi_reap(void)
             i++;
         }
     }
+    pthread_mutex_unlock(&orphans_lock);
     return n;
 }

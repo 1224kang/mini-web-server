@@ -29,7 +29,16 @@ int cgi_reaper_fd(void);
  * "고아 목록"에 넣어 두었다가 SIGCHLD 가 올 때 cgi_reap 이 거둔다. */
 void cgi_release(pid_t pid, int kill_it);
 
-/* 고아 목록에서 끝난 자식을 waitpid 로 거둔다. 거둔 수를 돌려준다. */
+/* 고아 목록에서 끝난 자식을 waitpid 로 거둔다. 거둔 수를 돌려준다.
+ * cgi_release 와 cgi_reap 은 여러 이벤트 루프 스레드에서 불러도 된다(내부 mutex). */
 int cgi_reap(void);
+
+/* fd 누수 방지 잠금.
+ * fd 를 만들고(socket, accept, pipe) FD_CLOEXEC 를 켜기 "전에" 다른 스레드가 fork 하면,
+ * 그 fd 가 CGI 자식에게 복사되어 자식이 끝날 때까지 열려 있다(상대는 EOF 를 늦게 본다).
+ * O_CLOEXEC 없이 fd 를 만드는 곳은 이 잠금 안에서 만들고 FD_CLOEXEC 까지 켠다.
+ * cgi_spawn 은 같은 잠금을 잡고 pipe + fork 를 한다. */
+void cgi_fd_guard_enter(void);
+void cgi_fd_guard_leave(void);
 
 #endif

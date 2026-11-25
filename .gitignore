@@ -1,5 +1,6 @@
 webserver
 webserver_asan
+webserver_tsan
 /build/
 *.o
 tests/test_http

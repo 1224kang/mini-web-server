@@ -155,6 +155,20 @@ int main(int argc, char **argv)
     cfg.port = (int)port;
     cfg.docroot = docroot;
 
+    /* 이벤트 루프 스레드 수: 설정에 없으면 CPU 코어 수(최대 8) */
+    int workers = cfg.workers;
+    if (workers <= 0) {
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        workers = cpus < 1 ? 1 : cpus > 8 ? 8 : (int)cpus;
+    }
+    /* 루프마다 깨우기용 파이프 fd 2개를 더 쓴다 */
+    if (max_conns > fd_limit - FD_RESERVED - 2L * workers)
+        max_conns = fd_limit - FD_RESERVED - 2L * workers;
+    if (max_conns < 1) {
+        fprintf(stderr, "fd limit %ld is too low for %d workers\n", fd_limit, workers);
+        return 1;
+    }
+
     /* 로그를 파일로 리다이렉트해도 한 줄씩 바로 출력되게 한다. */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -164,8 +178,8 @@ int main(int argc, char **argv)
     int listen_fd = server_listen((int)port);
     if (listen_fd < 0)
         return 1;
-    printf("listening on http://localhost:%ld (docroot: %s, event loop, max %ld connections, fd limit %ld)\n",
-           port, docroot, max_conns, fd_limit);
+    printf("listening on http://localhost:%ld (docroot: %s, %d event loop%s, max %ld connections, fd limit %ld)\n",
+           port, docroot, workers, workers == 1 ? "" : "s", max_conns, fd_limit);
     if (cfg.cgi_dir[0])
         printf("  cgi:   /cgi-bin/* -> %s (timeout %d ms)\n", cfg.cgi_dir, cfg.cgi_timeout_ms);
     for (int i = 0; i < cfg.nroutes; i++) {
@@ -178,7 +192,7 @@ int main(int argc, char **argv)
 
     /* 여기서 루프가 돈다. 종료 신호를 받고 열린 연결이 다 끝나면 돌아온다. */
     struct server_stats s = { 0 };
-    int rc = server_run(listen_fd, stop_pipe[0], &cfg, (int)max_conns, &s);
+    int rc = server_run(listen_fd, stop_pipe[0], &cfg, (int)max_conns, workers, &s);
 
     printf("[loop] bye (connections: %lu, requests: %lu, rejected: %lu)\n", s.connections,
            s.requests, s.rejected);

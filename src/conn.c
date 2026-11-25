@@ -11,6 +11,7 @@
 #include <limits.h> /* PATH_MAX, LLONG_MAX */
 #include <poll.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,9 +107,10 @@ struct conn {
     char up_name[PATH_MAX]; /* 로그용: 스크립트 경로 또는 백엔드 주소 */
 };
 
-static unsigned long total_requests; /* 스레드가 하나라 lock 이 필요 없다 */
+/* 모든 이벤트 루프 스레드가 함께 센다 → atomic */
+static atomic_ulong total_requests;
 
-unsigned long conn_total_requests(void) { return total_requests; }
+unsigned long conn_total_requests(void) { return atomic_load(&total_requests); }
 
 long long now_ms(void)
 {
@@ -713,12 +715,16 @@ static void start_proxy(struct conn *c, struct proxy_route *route, long long now
     c->up_send = c->up_req;
     c->up_send_sent = 0;
 
+    /* socket() 과 FD_CLOEXEC 사이에 다른 스레드가 CGI 를 fork 하면 이 소켓이 자식에게 샌다 */
+    cgi_fd_guard_enter();
     int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0)
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+    cgi_fd_guard_leave();
     if (fd < 0) {
         upstream_fail(c, 502, strerror(errno), now);
         return;
     }
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     c->up_out_fd = fd;
     conn_log(c, "proxy %s %s -> %s (route %s)", c->req.method, c->req.target, b->name,
@@ -983,7 +989,7 @@ static void process_head(struct conn *c, size_t head_len, long long now)
                                                   : 400, now);
         return;
     }
-    total_requests++;
+    atomic_fetch_add_explicit(&total_requests, 1, memory_order_relaxed);
     c->head_only = strcmp(c->req.method, "HEAD") == 0;
 
     /* 응답 헤더에 Connection 을 써야 하므로 보내기 "전에" 정한다.

@@ -87,6 +87,13 @@ int config_load(struct server_config *cfg, const char *path)
                 fprintf(stderr, "%s:%d: cgi_dir not found: %s\n", path, lineno, val ? val : "");
                 rc = -1;
             }
+        } else if (strcmp(key, "workers") == 0) {
+            char *end;
+            long v = val ? strtol(val, &end, 10) : 0;
+            if (!val || *end != '\0' || v < 1 || v > CONFIG_MAX_WORKERS)
+                rc = -1;
+            else
+                cfg->workers = (int)v;
         } else if (strcmp(key, "keepalive_timeout_ms") == 0) {
             rc = parse_ms(val, &cfg->keepalive_timeout_ms);
         } else if (strcmp(key, "header_timeout_ms") == 0) {
@@ -107,6 +114,7 @@ int config_load(struct server_config *cfg, const char *path)
             }
             struct proxy_route *r = &cfg->routes[cfg->nroutes];
             memset(r, 0, sizeof(*r));
+            atomic_init(&r->next, 0);
             strcpy(r->prefix, val);
             char *b;
             while ((b = strtok_r(NULL, " \t\r\n", &save))) {
@@ -149,5 +157,6 @@ struct proxy_route *config_match_route(struct server_config *cfg, const char *ta
 
 const struct backend *config_pick_backend(struct proxy_route *route)
 {
-    return &route->backends[route->next++ % (unsigned long)route->nbackends];
+    unsigned long n = atomic_fetch_add_explicit(&route->next, 1, memory_order_relaxed);
+    return &route->backends[n % (unsigned long)route->nbackends];
 }
