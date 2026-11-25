@@ -3,7 +3,7 @@
 <text x="84" y="38" font-size="20" font-weight="600" fill="#0b0b0b">노는 연결이 늘어도 처리량이 유지되는가</text>
 <text x="84" y="62" font-size="13" fill="#52514e">루프 1개, 활성 연결 50개로 측정 · 다른 연결 수천 개가 keep-alive로 대기 중</text>
 <line x1="84" y1="430.0" x2="610" y2="430.0" stroke="#e4e3df" stroke-width="1"/>
-0</text>
+<text x="74" y="434.0" font-size="12" fill="#52514e" text-anchor="end">0</text>
 <line x1="84" y1="346.5" x2="610" y2="346.5" stroke="#e4e3df" stroke-width="1"/>
 <text x="74" y="350.5" font-size="12" fill="#52514e" text-anchor="end">12.5k</text>
 <line x1="84" y1="263.0" x2="610" y2="263.0" stroke="#e4e3df" stroke-width="1"/>
