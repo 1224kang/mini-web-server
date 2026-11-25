@@ -159,7 +159,7 @@ def test_pipelining():
     s = connect()
     # 요청 두 개를 send 한 번에 붙여서 보낸다.
     s.sendall(b"GET /css/style.css HTTP/1.1\r\nHost: t\r\n\r\n"
-              b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping")
+              b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping")
     r1 = read_response(s)
     leftover = r1[3]
     # 두 번째 응답이 이미 같이 왔을 수 있다

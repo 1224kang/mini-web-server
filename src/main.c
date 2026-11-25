@@ -1,3 +1,5 @@
+#include "cgi.h"
+#include "config.h"
 #include "server.h"
 
 #include <errno.h>
@@ -48,6 +50,9 @@ static int setup_signals(void)
     }
     /* 쓰기 쪽 non-blocking: 핸들러가 절대 멈추면 안 된다. */
     fcntl(stop_pipe[1], F_SETFL, fcntl(stop_pipe[1], F_GETFL) | O_NONBLOCK);
+    /* CGI 자식에게 새지 않게 */
+    fcntl(stop_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(stop_pipe[1], F_SETFD, FD_CLOEXEC);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -97,8 +102,15 @@ static long parse_long(const char *s, long lo, long hi)
 
 int main(int argc, char **argv)
 {
+    const char *prog = argv[0];
+    const char *conf_path = NULL;
+    if (argc >= 3 && strcmp(argv[1], "-c") == 0) { /* -c <설정 파일> 은 맨 앞에만 */
+        conf_path = argv[2];
+        argv += 2;
+        argc -= 2;
+    }
     if (argc < 2 || argc > 4) {
-        fprintf(stderr, "usage: %s <port> [docroot=./www] [max_conns=auto]\n", argv[0]);
+        fprintf(stderr, "usage: %s [-c config] <port> [docroot=./www] [max_conns=auto]\n", prog);
         return 1;
     }
     long port = parse_long(argv[1], 1, 65535); //포트번호 검사
@@ -135,10 +147,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* CGI 디렉토리 (cgi_dir 기본값 "./cgi-bin" 은 현재 디렉토리 기준) */
+    static struct server_config cfg;
+    config_defaults(&cfg);
+    if (conf_path && config_load(&cfg, conf_path) < 0)
+        return 1;
+    cfg.port = (int)port;
+    cfg.docroot = docroot;
+
     /* 로그를 파일로 리다이렉트해도 한 줄씩 바로 출력되게 한다. */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    if (setup_signals() < 0)
+    if (setup_signals() < 0 || cgi_reaper_init() < 0)
         return 1;
 
     int listen_fd = server_listen((int)port);
@@ -146,10 +166,11 @@ int main(int argc, char **argv)
         return 1;
     printf("listening on http://localhost:%ld (docroot: %s, event loop, max %ld connections, fd limit %ld)\n",
            port, docroot, max_conns, fd_limit);
-
+    if (cfg.cgi_dir[0])
+        printf("  cgi:   /cgi-bin/* -> %s (timeout %d ms)\n", cfg.cgi_dir, cfg.cgi_timeout_ms);
     /* 여기서 루프가 돈다. 종료 신호를 받고 열린 연결이 다 끝나면 돌아온다. */
     struct server_stats s = { 0 };
-    int rc = server_run(listen_fd, stop_pipe[0], docroot, (int)max_conns, &s);
+    int rc = server_run(listen_fd, stop_pipe[0], &cfg, (int)max_conns, &s);
 
     printf("[loop] bye (connections: %lu, requests: %lu, rejected: %lu)\n", s.connections,
            s.requests, s.rejected);

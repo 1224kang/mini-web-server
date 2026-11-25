@@ -1,0 +1,4 @@
+#!/bin/sh
+# 헤더도 안 쓰고 죽는 CGI → 502 Bad Gateway
+echo "crash: dying without output" >&2
+exit 1

@@ -1,0 +1,6 @@
+#!/bin/sh
+# /cgi-bin/sleep?3  → 3초 뒤 응답. cgi_timeout_ms 를 넘기면 서버가 kill 하고 504.
+s=${QUERY_STRING:-1}
+case "$s" in ''|*[!0-9]*) s=1 ;; esac
+sleep "$s"
+printf 'Content-Type: text/plain\r\n\r\nslept %s\n' "$s"

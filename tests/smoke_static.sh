@@ -78,7 +78,7 @@ if [ "$(id -u)" -ne 0 ]; then
     check "읽기 권한 없음 → 403"            403 "$(status "$BASE/noperm.txt")"
 fi
 check "DELETE → 405"                      405 "$(status -X DELETE "$BASE/")"
-check "405 Allow 헤더" "GET, HEAD, POST" "$(curl -s -D - -o /dev/null -X DELETE "$BASE/" | tr -d '\r' | awk -F': ' 'tolower($1)=="allow"{print $2}')"
+check "405 Allow 헤더" "GET, HEAD" "$(curl -s -D - -o /dev/null -X DELETE "$BASE/" | tr -d '\r' | awk -F': ' 'tolower($1)=="allow"{print $2}')"
 check "잘못된 %xx → 400"                  400 "$(status "$BASE/bad%zz")"
 check "%00 → 400"                        400 "$(status "$BASE/index.html%00.png")"
 
@@ -91,8 +91,9 @@ check "%2e%2e%2f 탈출 → 403"              403 "$(status --path-as-is "$BASE/
 check "심볼릭 링크 탈출 → 403"              403 "$(status "$BASE/escape_link")"
 check "secret 내용 유출 없음"              "" "$(curl -s --path-as-is "$BASE/../secret.txt" | grep secret)"
 
-# --- 2단계 기능 유지 -----------------------------------------------------
-check "POST echo 유지"                    "ping" "$(curl -s -d ping "$BASE/echo")"
+# --- 2단계 기능 유지 (5단계에서 /builtin/echo 로 이동) -----------------------------------------------------
+check "POST echo (/builtin/echo)"        "ping" "$(curl -s -d ping "$BASE/builtin/echo")"
+check "정적 경로에 POST → 405"           405 "$(status -d ping "$BASE/index.html")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || { echo "--- server log ---"; cat "$TMP/server.log"; exit 1; }
