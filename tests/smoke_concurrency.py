@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """4단계 스모크 테스트: 동시 접속, keep-alive, 타임아웃, 503, SIGPIPE, SIGINT 종료.
-(서버 모델: 단일 스레드 poll 이벤트 루프)
+(서버 모델: acceptor 1개 + poll 이벤트 루프 스레드 N개. 기본은 CPU 코어 수)
 
 실행: make smoke-concurrency
 (bash 3.2 로는 소켓 여러 개를 정확한 타이밍으로 붙잡고 있기 어려워서 파이썬으로 썼다.
@@ -21,7 +21,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-BIN = os.path.join(REPO, "webserver")
+BIN = os.environ.get("WEBSERVER", os.path.join(REPO, "webserver"))
 PORT = int(os.environ.get("PORT", "18199"))
 
 passed = failed = 0
@@ -41,9 +41,9 @@ def check(name, ok, detail=""):
 
 # ---------------------------------------------------------------- helpers
 
-def start_server(port, root, max_conns=None):
+def start_server(port, root, max_conns=None, conf=None):
     log = open(os.path.join(TMP, f"server-{port}.log"), "w")
-    args = [BIN, str(port), root] + ([str(max_conns)] if max_conns else [])
+    args = [BIN] + (["-c", conf] if conf else []) + [str(port), root] + ([str(max_conns)] if max_conns else [])
     proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
     for _ in range(50):
         try:
@@ -243,6 +243,69 @@ def test_sigpipe():
     check("클라이언트가 중간에 끊어도 서버 생존 (SIGPIPE 무시)", SERVER.poll() is None and get("/")[0] == 200)
 
 
+def write_conf(name, text):
+    path = os.path.join(TMP, name)
+    with open(path, "w") as f:
+        f.write(text)
+    return path
+
+
+def test_workers_spread():
+    """workers 4: 연결이 루프 4개에 고르게 나뉘고, 각 루프가 동시에 요청을 처리한다."""
+    port = PORT + 5
+    proc = start_server(port, ROOT, conf=write_conf("w4.conf", "workers 4\n"))
+    time.sleep(0.2)
+    holders = [connect(port) for _ in range(16)]  # 놀고 있는 연결 16개
+    time.sleep(0.3)
+    log = open(os.path.join(TMP, f"server-{port}.log")).read()
+    per_loop = [len(re.findall(rf"\[loop{i}\] accepted", log)) for i in range(1, 5)]
+    check("workers 4: 시작 로그에 4 event loops", "4 event loops" in log, log[:200])
+    # 접속 확인용 연결 1개가 먼저 들어갔으므로 합계 17, 루프별 4~5개
+    check("연결이 가장 적은 루프로 분배 (루프별 4~5개)", sum(per_loop) == 17 and min(per_loop) >= 4,
+          per_loop)
+
+    # 놀고 있는 연결이 모든 루프에 걸려 있어도 각 연결에서 요청이 바로 처리된다
+    t0 = time.time()
+    ok = 0
+    for s in holders:
+        s.sendall(b"GET /index.html HTTP/1.1\r\nHost: t\r\n\r\n")
+    for s in holders:
+        r = read_response(s)
+        ok += r is not None and r[0] == 200
+        s.close()
+    check("모든 루프의 keep-alive 연결이 응답", ok == 16 and time.time() - t0 < 2, f"{ok}/16")
+
+    with concurrent.futures.ThreadPoolExecutor(64) as ex:
+        codes = list(ex.map(lambda _: (get("/index.html", port=port) or (0,))[0], range(400)))
+    check("workers 4: 동시 요청 400개 모두 200", codes.count(200) == 400, f"{codes.count(200)}/400")
+
+    proc.send_signal(signal.SIGINT)
+    proc.wait(timeout=10)
+    log = open(os.path.join(TMP, f"server-{port}.log")).read()
+    m = re.search(r"connections: (\d+), requests: (\d+)", log)
+    check("workers 4: 종료 통계는 모든 루프 합계", m is not None and int(m.group(2)) >= 416,
+          m.group(0) if m else log[-300:])
+    check("workers 4: SIGINT 정상 종료 (exit 0)", proc.returncode == 0, f"rc={proc.returncode}")
+
+
+def test_single_worker():
+    """workers 1: 예전 단일 루프와 같은 구조로도 동작한다."""
+    port = PORT + 6
+    proc = start_server(port, ROOT, conf=write_conf("w1.conf", "workers 1\n"))
+    r = get("/index.html", port=port)
+    proc.send_signal(signal.SIGINT)
+    proc.wait(timeout=10)
+    log = open(os.path.join(TMP, f"server-{port}.log")).read()
+    check("workers 1: 1 event loop 로 정상 응답",
+          r is not None and r[0] == 200 and "1 event loop," in log and "[loop2]" not in log, log[:200])
+
+
+def test_bad_workers():
+    path = write_conf("w0.conf", "workers 0\n")
+    r = subprocess.run([BIN, "-c", path, str(PORT + 7), ROOT], capture_output=True, text=True, timeout=5)
+    check("workers 0 → 설정 오류로 시작 안 함", r.returncode != 0 and "invalid line" in r.stderr, r.stderr)
+
+
 def test_busy_503():
     port = PORT + 1
     proc = start_server(port, ROOT, max_conns=16)  # 동시 연결 16개까지
@@ -372,6 +435,9 @@ if __name__ == "__main__":
         test_sigpipe()
         test_many_idle_connections()
         test_busy_503()
+        test_workers_spread()
+        test_single_worker()
+        test_bad_workers()
         test_graceful_shutdown()
         test_double_sigint()
 

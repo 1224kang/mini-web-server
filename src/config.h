@@ -6,6 +6,7 @@
  *
  * 설정 파일 형식 (한 줄에 하나, '#' 뒤는 주석):
  *
+ *   workers                  4          (이벤트 루프 스레드 수, 생략하면 CPU 코어 수)
  *   cgi_dir                  cgi-bin
  *   cgi_timeout_ms           5000
  *   keepalive_timeout_ms     5000
@@ -21,6 +22,7 @@
 
 #include <limits.h> /* PATH_MAX */
 #include <netinet/in.h>
+#include <stdatomic.h>
 
 #define CONFIG_MAX_ROUTES   16
 #define CONFIG_MAX_BACKENDS 8
@@ -35,12 +37,17 @@ struct proxy_route {
     char prefix[CONFIG_MAX_PREFIX];
     struct backend backends[CONFIG_MAX_BACKENDS];
     int nbackends;
-    unsigned long next; /* 다음에 고를 백엔드 번호. 스레드가 하나라 lock 이 필요 없다 */
+    /* 다음에 고를 백엔드 번호. 여러 이벤트 루프 스레드가 함께 쓰므로 atomic 으로 하나씩 올린다
+     * (lock 없이도 두 스레드가 같은 번호를 받지 않는다). */
+    atomic_ulong next;
 };
+
+#define CONFIG_MAX_WORKERS 64
 
 struct server_config {
     int port;
     const char *docroot;          /* realpath 로 정규화된 절대 경로 */
+    int workers;                  /* 이벤트 루프 스레드 수. 0 이면 CPU 코어 수(최대 8) */
     int keepalive_timeout_ms;    /* 요청 첫 바이트까지 기다리는 시간 */
     int header_timeout_ms;       /* 첫 바이트부터 헤더 전체까지의 마감 */
     int body_timeout_ms;         /* 헤더 파싱 후 본문 전체까지의 마감 */

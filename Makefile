@@ -1,5 +1,5 @@
 CC      := cc
-CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -g -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
+CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -g -pthread -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
 MODE    ?= release
 PORT    ?= 18080
 SRCS    := src/main.c src/server.c src/http.c src/static_files.c src/conn.c \
@@ -11,6 +11,11 @@ ifeq ($(MODE),asan)
 CFLAGS   += -fsanitize=address -fno-omit-frame-pointer
 TARGET   := webserver_asan
 TEST_DIR := $(OBJ_DIR)
+else ifeq ($(MODE),tsan)
+# 이벤트 루프 스레드 사이의 데이터 경쟁 검사
+CFLAGS   += -fsanitize=thread -O1
+TARGET   := webserver_tsan
+TEST_DIR := $(OBJ_DIR)
 else
 TARGET   := webserver
 TEST_DIR := tests
@@ -18,7 +23,7 @@ endif
 
 TEST_BIN := $(addprefix $(TEST_DIR)/,test_http test_static test_dynamic)
 
-.PHONY: all clean run run-proxy backends asan test test-asan smoke smoke-concurrency smoke-dynamic
+.PHONY: all clean run run-proxy backends asan tsan test test-asan smoke smoke-concurrency smoke-dynamic
 
 all: $(TARGET)
 
@@ -76,9 +81,12 @@ backends:
 asan:
 	$(MAKE) MODE=asan all
 
+tsan:
+	$(MAKE) MODE=tsan all
+
 test-asan:
 	$(MAKE) MODE=asan test
 
 clean:
-	rm -f $(SRCS:.c=.o) webserver webserver_asan tests/test_http tests/test_static tests/test_dynamic
-	rm -rf build/release build/asan
+	rm -f $(SRCS:.c=.o) webserver webserver_asan webserver_tsan tests/test_http tests/test_static tests/test_dynamic
+	rm -rf build/release build/asan build/tsan
