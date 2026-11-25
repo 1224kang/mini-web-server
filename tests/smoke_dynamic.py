@@ -23,6 +23,7 @@ REPO = os.path.dirname(HERE)
 BIN = os.environ.get("WEBSERVER", os.path.join(REPO, "webserver"))
 PORT = int(os.environ.get("PORT", "18299"))
 BACKEND_PORTS = [18301, 18302, 18303]
+FAIL_MS = 1500  # proxy_fail_timeout_ms: 연결에 실패한 백엔드를 건너뛰는 시간
 TMP = tempfile.mkdtemp(prefix="mws-dyn-")
 
 passed = failed = 0
@@ -467,17 +468,60 @@ def test_proxy(backends):
     # 백엔드 하나 죽이기
     backends[1].terminate()
     backends[1].wait()
-    codes = [request("GET", "/api/dead")[0] for _ in range(6)]
-    check("백엔드 하나 죽이면 3번에 1번 502", sorted(codes) == [200, 200, 200, 200, 502, 502], codes)
+    # 장애 조치: 연결 거부된 백엔드는 down 표시 + 다른 백엔드로 재시도
+    dead = f"b{BACKEND_PORTS[1]}"
+    got = [request("GET", "/api/dead") for _ in range(6)]
+    codes = [g[0] for g in got]
+    seen = [json.loads(g[2])["backend"] for g in got if g[0] == 200]
+    check("백엔드 하나가 죽어도 재시도로 6번 모두 200", codes == [200] * 6, codes)
+    check("죽은 백엔드는 down 처리: 나머지 둘이 3번씩",
+          dead not in seen and sorted(seen.count(n) for n in set(seen)) == [3, 3], seen)
+    check("down 표시와 재시도 로그",
+          f"127.0.0.1:{BACKEND_PORTS[1]}: Connection refused, marked down for {FAIL_MS} ms, retrying"
+          in server_log(), "")
 
+    # 복구: 다시 띄우고 fail_timeout 이 지나면 다시 분배된다
+    backends[1] = start_backend(BACKEND_PORTS[1])
+    time.sleep(FAIL_MS / 1000 + 0.2)
+    seen = [json.loads(request("GET", "/api/back")[2])["backend"] for _ in range(6)]
+    check("fail_timeout 이 지나면 되살아난 백엔드도 다시 분배", sorted(set(seen)) == sorted(names), seen)
+
+    # POST 도 재시도한다: 요청을 한 바이트도 보내기 전(connect 단계)에 실패했으므로 안전
+    backends[1].terminate()
+    backends[1].wait()
+    posts = [request("POST", "/api/post", f"n={i}".encode()) for i in range(3)]
+    check("죽은 백엔드에 걸린 POST 도 다른 백엔드로 재시도",
+          all(st == 200 and json.loads(b)["body"] == f"n={i}" for i, (st, _, b, _) in enumerate(posts)),
+          [p[0] for p in posts])
+
+    # 응답 단계의 실패(느린 백엔드)는 요청을 이미 보냈으므로 재시도하지 않고 504
     st, _, _, dt = request("GET", "/api/slow?ms=3000")
-    # 죽은 백엔드에 걸리면 502 가 먼저 나오므로 살아 있는 백엔드에 걸릴 때까지
-    while st == 502:
-        st, _, _, dt = request("GET", "/api/slow?ms=3000")
     check("느린 백엔드(3초) → proxy_timeout(1초) 후 504", st == 504 and 0.8 < dt < 2.0, f"{st} {dt:.2f}s")
 
     st, _, _, _ = request("GET", "/index.html")
     check("프록시 실패 뒤에도 정적 파일 정상", st == 200)
+
+
+def server_log():
+    with open(os.path.join(TMP, "server.log")) as f:
+        return f.read()
+
+
+def test_failover_routes():
+    # 응답하지 않는 주소(connect 타임아웃) 또는 도달 불가 주소 → 다음 백엔드로
+    t0 = time.time()
+    st, _, b, _ = request("GET", "/blackhole/1")
+    dt1 = time.time() - t0
+    check("응답 없는 백엔드(connect 실패/타임아웃) → 다음 백엔드로 재시도",
+          st == 200 and json.loads(b)["backend"] == f"b{BACKEND_PORTS[0]}" and dt1 < 1.5,
+          f"{st} {dt1:.2f}s")
+    later = [request("GET", f"/blackhole/{i}") for i in range(2, 5)]
+    check("down 된 백엔드는 이후 요청에서 기다리지 않고 건너뜀",
+          all(st == 200 and dt < 0.3 for st, _, _, dt in later), [(g[0], round(g[3], 2)) for g in later])
+
+    st, _, _, dt = request("GET", "/alldead/x")
+    check("모든 백엔드가 죽어 있으면 502", st == 502 and dt < 1.0, f"{st} {dt:.2f}s")
+    check("모든 백엔드 실패 로그", "no backend left" in server_log(), "")
 
 
 # ---------------------------------------------------------------- main
@@ -495,7 +539,10 @@ def main():
                 "body_timeout_ms 350\n"
                 "proxy_connect_timeout_ms 500\n"
                 "proxy_timeout_ms 1000\n"
-                "proxy /api/ " + " ".join(f"127.0.0.1:{p}" for p in BACKEND_PORTS) + "\n")
+                f"proxy_fail_timeout_ms {FAIL_MS}\n"
+                "proxy /api/ " + " ".join(f"127.0.0.1:{p}" for p in BACKEND_PORTS) + "\n"
+                f"proxy /blackhole/ 10.255.255.1:9 127.0.0.1:{BACKEND_PORTS[0]}\n"
+                "proxy /alldead/ 127.0.0.1:18391 127.0.0.1:18392\n")
 
     backends = [start_backend(p) for p in BACKEND_PORTS]
     log = open(os.path.join(TMP, "server.log"), "w")
@@ -509,6 +556,7 @@ def main():
         test_builtin()
         test_request_chunked()
         test_configured_timeouts()
+        test_failover_routes()
         test_proxy(backends)
 
         time.sleep(0.3)

@@ -305,6 +305,43 @@ static void test_routes(void)
     for (int i = 0; seq[i]; i++)
         CHECK(config_pick_backend(&cfg.routes[0])->name[0] == seq[i]);
     printf("PASS routes + round-robin\n");
+
+    /* 장애 조치: 다음 차례는 c. b 를 down 으로 표시하면 a, c 만 번갈아 나온다 */
+    struct proxy_route *r = &cfg.routes[0];
+    long long now = 1000;
+    config_mark_down(&r->backends[1], now + 500);
+    CHECK(config_is_down(&r->backends[1], now) && !config_is_down(&r->backends[1], now + 500));
+    const char *alive_seq = "caca";
+    for (int i = 0; alive_seq[i]; i++) {
+        unsigned tried = 0;
+        struct backend *b = config_pick_alive(r, now, &tried);
+        CHECK(b && b->name[0] == alive_seq[i]);
+    }
+
+    /* 한 요청 안의 재시도: 이미 시도한 백엔드는 다시 고르지 않고, 다 해 보면 NULL */
+    unsigned tried = 0;
+    struct backend *first = config_pick_alive(r, now, &tried);
+    struct backend *second = config_pick_alive(r, now, &tried);
+    CHECK(first && second && first != second && first != &r->backends[1] && second != &r->backends[1]);
+    struct backend *third = config_pick_alive(r, now, &tried); /* 살아 있는 건 다 해 봄 → down 인 b 로 복구 확인 */
+    CHECK(third == &r->backends[1]);
+    CHECK(config_pick_alive(r, now, &tried) == NULL);
+    CHECK(tried == 7);
+
+    /* fail_timeout 이 지나면 다시 후보가 된다 */
+    int seen_b = 0;
+    for (int i = 0; i < 3; i++) {
+        unsigned t = 0;
+        seen_b |= config_pick_alive(r, now + 500, &t) == &r->backends[1];
+    }
+    CHECK(seen_b);
+
+    /* 전부 down: 그래도 하나씩 시도해 본다(복구 확인) */
+    for (int i = 0; i < 3; i++)
+        config_mark_down(&r->backends[i], now + 500);
+    tried = 0;
+    CHECK(config_pick_alive(r, now, &tried) != NULL);
+    printf("PASS backend failover selection\n");
 }
 
 int main(void)

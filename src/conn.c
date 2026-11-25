@@ -99,6 +99,9 @@ struct conn {
     pid_t cgi_pid;          /* 아직 cgi_release 하지 않은 자식 (0 이면 없음) */
     int up_in_fd, up_out_fd;
     enum proxy_step px_step; /* 프록시: 지금 몇 번째 단계인지 (CGI 는 PX_NONE) */
+    struct proxy_route *px_route; /* 장애 조치: 이 요청의 경로 (재시도 때 다시 고른다) */
+    struct backend *px_backend;   /* 지금 연결 중인 백엔드 */
+    unsigned px_tried;            /* 이 요청에서 이미 시도한 백엔드 비트 */
     long proxy_remaining;   /* 남은 백엔드 본문 바이트. -1이면 EOF까지 받는다 */
     int proxy_chunked_in, proxy_chunked_out;
     unsigned proxy_informational;
@@ -174,6 +177,9 @@ static void release_upstream(struct conn *c)
 static void release_response(struct conn *c)
 {
     release_upstream(c);
+    c->px_route = NULL; /* 다음 요청은 새로 고른다 */
+    c->px_backend = NULL;
+    c->px_tried = 0;
     free(c->out);
     c->out = NULL;
     c->out_len = c->out_sent = 0;
@@ -706,9 +712,19 @@ static void start_cgi(struct conn *c, long long now)
 
 /* 클라이언트는 우리 서버에게 물었다고 생각한다. 실제 답은 백엔드가 하고, 우리는
  * 요청을 다시 써서 넘기고(Host, X-Forwarded-For), 답을 다시 써서 돌려준다(Connection, Via). */
+static void proxy_connect_failed(struct conn *c, const char *why, int timed_out, long long now);
+
+/* 백엔드 하나를 골라 연결을 시작한다. connect 가 실패하면 proxy_connect_failed 가
+ * 그 백엔드를 down 으로 표시하고 다시 여기로 와서 다음 백엔드를 고른다. */
 static void start_proxy(struct conn *c, struct proxy_route *route, long long now)
 {
-    const struct backend *b = config_pick_backend(route); /* Round-Robin */
+    if (c->px_route != route) { /* 이 요청의 첫 시도 */
+        c->px_route = route;
+        c->px_tried = 0;
+    }
+    /* Round-Robin + 장애 조치: down 인 백엔드와 이번 요청에서 실패한 백엔드는 건너뛴다 */
+    struct backend *b = config_pick_alive(route, now, &c->px_tried);
+    c->px_backend = b;
     c->up_kind = UP_PROXY;
     snprintf(c->up_name, sizeof(c->up_name), "%s", b->name);
 
@@ -746,8 +762,42 @@ static void start_proxy(struct conn *c, struct proxy_route *route, long long now
         c->px_step = PX_CONNECTING;
         set_state(c, ST_UPSTREAM, now + c->cfg->proxy_connect_timeout_ms);
     } else {
-        upstream_fail(c, 502, strerror(errno), now); /* 보통 ECONNREFUSED: 백엔드가 죽어 있다 */
+        proxy_connect_failed(c, strerror(errno), 0, now); /* 보통 ECONNREFUSED: 백엔드가 죽어 있다 */
     }
+}
+
+static int count_bits(unsigned v)
+{
+    int n = 0;
+    for (; v; v &= v - 1)
+        n++;
+    return n;
+}
+
+/* 연결 단계에서 실패했다(거부, 도달 불가, connect 타임아웃).
+ * 요청은 한 바이트도 보내지 않았으므로 메서드와 상관없이 다른 백엔드로 다시 보내도 안전하다.
+ *   - 이 백엔드는 proxy_fail_timeout_ms 동안 down → 다른 요청들도 건너뛴다(passive health check)
+ *   - 아직 안 해 본 백엔드가 있으면 그쪽으로 재시도, 없으면 502(타임아웃이었으면 504) */
+static void proxy_connect_failed(struct conn *c, const char *why, int timed_out, long long now)
+{
+    struct backend *b = c->px_backend;
+    int fail_ms = c->cfg->proxy_fail_timeout_ms;
+    config_mark_down(b, now + fail_ms);
+
+    if (count_bits(c->px_tried) < c->px_route->nbackends) {
+        conn_log(c, "proxy %s: %s, marked down for %d ms, retrying next backend", b->name, why, fail_ms);
+        close(c->up_out_fd);
+        c->up_out_fd = -1;
+        free(c->up_req);
+        c->up_req = NULL;
+        c->up_send = NULL;
+        c->up_send_len = c->up_send_sent = 0;
+        c->px_step = PX_NONE;
+        start_proxy(c, c->px_route, now);
+        return;
+    }
+    conn_log(c, "proxy %s: %s, marked down for %d ms, no backend left", b->name, why, fail_ms);
+    upstream_fail(c, timed_out ? 504 : 502, why, now);
 }
 
 /* PX_CONNECTING 에서 POLLOUT 이 왔다 = connect 가 끝났다(성공이든 실패든). SO_ERROR 로 결과 확인. */
@@ -758,7 +808,7 @@ static void proxy_check_connect(struct conn *c, long long now)
     if (getsockopt(c->up_out_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
         err = errno;
     if (err) {
-        upstream_fail(c, 502, strerror(err), now);
+        proxy_connect_failed(c, strerror(err), 0, now);
         return;
     }
     c->px_step = PX_SENDING;
@@ -1394,8 +1444,10 @@ void conn_timeout(struct conn *c, long long now)
         else if (proxy_has_output(c)) {
             conn_log(c, "proxy send timed out (client not reading)");
             close_now(c);
-        } else
-            upstream_fail(c, 504, c->px_step == PX_CONNECTING ? "connect timed out" : "response timed out", now);
+        } else if (c->px_step == PX_CONNECTING)
+            proxy_connect_failed(c, "connect timed out", 1, now);
+        else
+            upstream_fail(c, 504, "response timed out", now);
         break;
     case ST_WRITE:
         conn_log(c, "send timed out (client not reading)");
