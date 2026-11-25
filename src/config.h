@@ -16,6 +16,7 @@
  *   proxy_connect_timeout_ms 1000
  *   proxy_timeout_ms         5000
  *   proxy_fail_timeout_ms   10000
+ *   proxy_retry_timeout_ms   5000
  *   proxy  /api/  127.0.0.1:8001 127.0.0.1:8002 127.0.0.1:8003
  *
  * proxy 줄은 "이 접두사로 시작하는 요청은 이 백엔드들에게 번갈아(Round-Robin) 넘긴다"는 뜻.
@@ -24,6 +25,8 @@
  * 장애 조치: 백엔드 연결(connect)에 실패하면 그 백엔드를 proxy_fail_timeout_ms 동안 down 으로
  * 표시해 건너뛰고, 같은 요청을 아직 안 해 본 다음 백엔드로 다시 보낸다. 요청을 한 바이트도
  * 보내기 전에 실패한 것이므로 POST 도 안전하게 재시도할 수 있다. 시간이 지나면 다시 시도한다.
+ * 연결된 뒤 proxy_timeout_ms 동안 응답이 없을 때도 그 백엔드를 down 으로 표시한다. 이때는 GET/HEAD 이고
+ * 응답을 시작하기 전이며 첫 시도부터 proxy_retry_timeout_ms 안일 때만 다른 백엔드로 재시도한다.
  */
 
 #include <limits.h> /* PATH_MAX */
@@ -65,7 +68,8 @@ struct server_config {
     int cgi_timeout_ms;
     int proxy_connect_timeout_ms;
     int proxy_timeout_ms;         /* 백엔드가 이 시간 동안 한 바이트도 안 보내면 504 */
-    int proxy_fail_timeout_ms;    /* connect 에 실패한 백엔드를 건너뛰는 시간 */
+    int proxy_fail_timeout_ms;    /* 연결 실패·응답 시간 초과가 난 백엔드를 건너뛰는 시간 */
+    int proxy_retry_timeout_ms;   /* 응답 시간 초과 재시도를 시작할 수 있는 한도(첫 시도부터) */
     struct proxy_route routes[CONFIG_MAX_ROUTES];
     int nroutes;
 };
