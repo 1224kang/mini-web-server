@@ -564,7 +564,7 @@ static int loop_init(struct loop *L, struct server *S, int index)
     /* 한 루프가 모든 연결을 맡게 될 수도 있으므로 배열은 전체 한도만큼 잡는다 */
     size_t max = (size_t)S->max_conns;
     L->max_events = (int)(max * CONN_MAX_FDS + 3); /* 등록될 수 있는 fd 전부 (+ wake, stop, reap) */
-    L->poller = poller_new();
+    L->poller = poller_new(S->cfg->event_backend);
     L->watches = calloc(max, sizeof(*L->watches));
     L->events = calloc((size_t)L->max_events, sizeof(*L->events));
     L->ready = calloc(max, sizeof(*L->ready));

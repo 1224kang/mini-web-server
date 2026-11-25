@@ -7,6 +7,7 @@
  * 설정 파일 형식 (한 줄에 하나, '#' 뒤는 주석):
  *
  *   workers                  4          (이벤트 루프 스레드 수, 생략하면 CPU 코어 수)
+ *   event_backend            auto       (auto | poll | epoll | kqueue)
  *   cgi_dir                  cgi-bin
  *   cgi_timeout_ms           5000
  *   keepalive_timeout_ms     5000
@@ -56,6 +57,7 @@ struct server_config {
     int port;
     const char *docroot;          /* realpath 로 정규화된 절대 경로 */
     int workers;                  /* 이벤트 루프 스레드 수. 0 이면 CPU 코어 수(최대 8) */
+    char event_backend[16];       /* "auto" 등. main 이 이 OS 에서 쓸 실제 이름으로 바꿔 둔다 */
     int keepalive_timeout_ms;    /* 요청 첫 바이트까지 기다리는 시간 */
     int header_timeout_ms;       /* 첫 바이트부터 헤더 전체까지의 마감 */
     int body_timeout_ms;         /* 헤더 파싱 후 본문 전체까지의 마감 */

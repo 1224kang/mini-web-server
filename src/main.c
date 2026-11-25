@@ -156,15 +156,35 @@ int main(int argc, char **argv)
     cfg.port = (int)port;
     cfg.docroot = docroot;
 
+    /* 이벤트 백엔드: 설정의 event_backend (기본 auto = epoll 또는 kqueue).
+     * 환경변수 WEBSERVER_EVENT_BACKEND 가 있으면 그게 이긴다 → 같은 설정으로 백엔드만 바꿔
+     * 테스트·측정할 수 있다. */
+    const char *want_backend = getenv("WEBSERVER_EVENT_BACKEND");
+    if (!want_backend || !*want_backend)
+        want_backend = cfg.event_backend;
+    const char *backend = poller_resolve(want_backend);
+    if (!backend) {
+        fprintf(stderr, "event backend not available on this system: %s (use auto, poll"
+#ifdef POLLER_HAVE_EPOLL
+                        ", epoll"
+#endif
+#ifdef POLLER_HAVE_KQUEUE
+                        ", kqueue"
+#endif
+                        ")\n", want_backend);
+        return 1;
+    }
+    snprintf(cfg.event_backend, sizeof(cfg.event_backend), "%s", backend);
+
     /* 이벤트 루프 스레드 수: 설정에 없으면 CPU 코어 수(최대 8) */
     int workers = cfg.workers;
     if (workers <= 0) {
         long cpus = sysconf(_SC_NPROCESSORS_ONLN);
         workers = cpus < 1 ? 1 : cpus > 8 ? 8 : (int)cpus;
     }
-    /* 루프마다 깨우기용 파이프 fd 2개를 더 쓴다 */
-    if (max_conns > fd_limit - FD_RESERVED - 2L * workers)
-        max_conns = fd_limit - FD_RESERVED - 2L * workers;
+    /* 루프마다 깨우기용 파이프 fd 2개 + epoll/kqueue fd 1개를 더 쓴다 */
+    if (max_conns > fd_limit - FD_RESERVED - 3L * workers)
+        max_conns = fd_limit - FD_RESERVED - 3L * workers;
     if (max_conns < 1) {
         fprintf(stderr, "fd limit %ld is too low for %d workers\n", fd_limit, workers);
         return 1;
@@ -180,7 +200,7 @@ int main(int argc, char **argv)
     if (listen_fd < 0)
         return 1;
     printf("listening on http://localhost:%ld (docroot: %s, %d event loop%s, %s backend, max %ld connections, fd limit %ld)\n",
-           port, docroot, workers, workers == 1 ? "" : "s", poller_backend(), max_conns, fd_limit);
+           port, docroot, workers, workers == 1 ? "" : "s", cfg.event_backend, max_conns, fd_limit);
     if (cfg.cgi_dir[0])
         printf("  cgi:   /cgi-bin/* -> %s (timeout %d ms)\n", cfg.cgi_dir, cfg.cgi_timeout_ms);
     for (int i = 0; i < cfg.nroutes; i++) {

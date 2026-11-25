@@ -11,6 +11,7 @@
 void config_defaults(struct server_config *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
+    snprintf(cfg->event_backend, sizeof(cfg->event_backend), "auto");
     cfg->keepalive_timeout_ms = 5000;
     cfg->header_timeout_ms = 10000;
     cfg->body_timeout_ms = 30000;
@@ -95,6 +96,12 @@ int config_load(struct server_config *cfg, const char *path)
                 rc = -1;
             else
                 cfg->workers = (int)v;
+        } else if (strcmp(key, "event_backend") == 0) {
+            /* 이름 확인은 main 이 한다(이 OS 에서 쓸 수 있는지는 event.c 가 안다) */
+            if (!val || strlen(val) >= sizeof(cfg->event_backend))
+                rc = -1;
+            else
+                snprintf(cfg->event_backend, sizeof(cfg->event_backend), "%s", val);
         } else if (strcmp(key, "keepalive_timeout_ms") == 0) {
             rc = parse_ms(val, &cfg->keepalive_timeout_ms);
         } else if (strcmp(key, "header_timeout_ms") == 0) {

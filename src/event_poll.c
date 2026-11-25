@@ -15,7 +15,8 @@
  *                 → mod/del 이 배열을 훑지 않고 O(1)
  */
 
-struct poller {
+struct poll_poller {
+    struct poller base;
     struct pollfd *pfds;
     void **ptrs;
     int n, cap;
@@ -24,33 +25,28 @@ struct poller {
     int start; /* 준비된 fd 가 max 보다 많을 때 다음 호출은 여기부터 (뒤쪽 fd 가 밀리지 않게) */
 };
 
-struct poller *poller_new(void)
+static struct poller *pp_create(void)
 {
-    return calloc(1, sizeof(struct poller));
+    struct poll_poller *p = calloc(1, sizeof(*p));
+    return p ? &p->base : NULL;
 }
 
-void poller_free(struct poller *p)
+static void pp_destroy(struct poller *base)
 {
-    if (!p)
-        return;
+    struct poll_poller *p = (struct poll_poller *)base;
     free(p->pfds);
     free(p->ptrs);
     free(p->slot);
     free(p);
 }
 
-const char *poller_backend(void)
-{
-    return "poll";
-}
-
-static int slot_of(const struct poller *p, int fd)
+static int slot_of(const struct poll_poller *p, int fd)
 {
     return fd < p->slot_cap ? p->slot[fd] - 1 : -1;
 }
 
 /* slot[fd] 를 쓸 수 있게 배열을 키운다. */
-static int grow_slot(struct poller *p, int fd)
+static int grow_slot(struct poll_poller *p, int fd)
 {
     if (fd < p->slot_cap)
         return 0;
@@ -67,7 +63,7 @@ static int grow_slot(struct poller *p, int fd)
     return 0;
 }
 
-static int grow_list(struct poller *p)
+static int grow_list(struct poll_poller *p)
 {
     if (p->n < p->cap)
         return 0;
@@ -84,8 +80,9 @@ static int grow_list(struct poller *p)
     return 0;
 }
 
-int poller_add(struct poller *p, int fd, short events, void *ptr)
+static int pp_add(struct poller *base, int fd, short events, void *ptr)
 {
+    struct poll_poller *p = (struct poll_poller *)base;
     if (fd < 0) {
         errno = EBADF;
         return -1;
@@ -104,8 +101,9 @@ int poller_add(struct poller *p, int fd, short events, void *ptr)
     return 0;
 }
 
-int poller_mod(struct poller *p, int fd, short events, void *ptr)
+static int pp_mod(struct poller *base, int fd, short events, void *ptr)
 {
+    struct poll_poller *p = (struct poll_poller *)base;
     int i = fd >= 0 ? slot_of(p, fd) : -1;
     if (i < 0) {
         errno = ENOENT;
@@ -116,8 +114,9 @@ int poller_mod(struct poller *p, int fd, short events, void *ptr)
     return 0;
 }
 
-int poller_del(struct poller *p, int fd)
+static int pp_del(struct poller *base, int fd)
 {
+    struct poll_poller *p = (struct poll_poller *)base;
     int i = fd >= 0 ? slot_of(p, fd) : -1;
     if (i < 0) {
         errno = ENOENT;
@@ -134,8 +133,9 @@ int poller_del(struct poller *p, int fd)
     return 0;
 }
 
-int poller_wait(struct poller *p, struct poller_event *out, int max, int timeout_ms)
+static int pp_wait(struct poller *base, struct poller_event *out, int max, int timeout_ms)
 {
+    struct poll_poller *p = (struct poll_poller *)base;
     int r = poll(p->pfds, (nfds_t)p->n, timeout_ms);
     if (r <= 0)
         return r;
@@ -160,3 +160,13 @@ int poller_wait(struct poller *p, struct poller_event *out, int max, int timeout
     }
     return got;
 }
+
+const struct poller_ops poller_poll_ops = {
+    .name = "poll",
+    .create = pp_create,
+    .destroy = pp_destroy,
+    .add = pp_add,
+    .mod = pp_mod,
+    .del = pp_del,
+    .wait = pp_wait,
+};

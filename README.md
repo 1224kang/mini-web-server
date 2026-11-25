@@ -1,6 +1,6 @@
 # mini-web-server
 
-정글 13기 13주차 13팀의 C/POSIX 웹 서버입니다. accept 전용 스레드 1개와 `poll` 이벤트 루프 스레드 N개(기본 CPU 코어 수)로 HTTP 요청, 정적 파일, CGI, 내장 핸들러, 리버스 프록시를 처리합니다.
+정글 13기 13주차 13팀의 C/POSIX 웹 서버입니다. accept 전용 스레드 1개와 이벤트 루프 스레드 N개(기본 CPU 코어 수, Linux는 `epoll`·macOS는 `kqueue`)로 HTTP 요청, 정적 파일, CGI, 내장 핸들러, 리버스 프록시를 처리합니다.
 
 ## 기존 PR 비교
 
@@ -44,7 +44,13 @@ poll(listen, stop)                        poll([wake, stop, 자식회수, 자기
 
 ### 이벤트 백엔드 (poller)
 
-루프는 `poll`을 직접 부르지 않고 `event.h`의 poller에 fd를 **등록**해 둡니다. epoll/kqueue로 바꿀 수 있게 하는 첫 단계이며, 지금 백엔드는 `poll` 하나(`event_poll.c`)입니다. 시작 로그에 `poll backend`로 표시됩니다.
+루프는 `poll`을 직접 부르지 않고 `event.h`의 poller에 fd를 **등록**해 둡니다. 백엔드는 실행할 때 고르며, 시작 로그에 `kqueue backend`처럼 표시됩니다.
+
+| 백엔드 | 파일 | OS | 기다릴 때 비용 |
+|---|---|---|---|
+| `poll` | `event_poll.c` | 모두 | 등록된 fd 전체를 매번 커널에 넘기고 훑음: O(등록된 fd 수) |
+| `epoll` | `event_epoll.c` | Linux | 커널이 등록을 들고 있고 준비된 fd만 돌려줌: O(준비된 fd 수) |
+| `kqueue` | `event_kqueue.c` | macOS, BSD | epoll과 같음 |
 
 | 함수 | 하는 일 |
 |---|---|
@@ -53,8 +59,9 @@ poll(listen, stop)                        poll([wake, stop, 자식회수, 자기
 
 - 연결이 기다리는 fd가 바뀔 수 있는 때는 그 연결을 건드린 직후뿐입니다(`conn_new`, `conn_handle`, `conn_timeout`, `conn_shutdown`). 루프는 그때만 `watch_sync`로 `conn_pollfds` 결과와 등록을 비교해 바뀐 것만 알립니다.
 - 이벤트의 `ptr`이 연결(`struct watch`)을 가리키므로, 이벤트가 온 연결을 배열을 훑지 않고 바로 찾습니다.
-- `conn.c`는 감시 중인 fd를 닫기 직전에 훅(`conn_set_close_hook`)을 부릅니다. epoll/kqueue는 등록을 커널이 들고 있어서, 루프 모르게 fd를 닫고 같은 번호로 새 fd를 열면(예: 프록시 재시도) 새 fd가 등록되지 않습니다. 훅에서 등록을 먼저 지워 이 문제를 막습니다.
-- 아직 남은 O(연결 수) 작업: `poll` 자체, 가장 가까운 마감 찾기, 마감 지난 연결 찾기, 끝난 연결 정리. 다음 단계에서 epoll/kqueue 백엔드와 타이머 힙으로 바꿉니다.
+- `conn.c`는 감시 중인 fd를 닫기 직전에 훅(`conn_set_close_hook`)을 부릅니다. epoll/kqueue는 등록을 커널이 들고 있어서, 루프 모르게 fd를 닫고 같은 번호로 새 fd를 열면(예: 프록시 재시도) 새 fd가 등록되지 않습니다. 또 epoll은 `fork`로 자식이 같은 파일을 들고 있으면 `close` 뒤에도 등록이 남습니다. 훅에서 등록을 먼저 지워 두 문제를 막습니다.
+- 백엔드별 차이: kqueue는 읽기와 쓰기를 따로 알려 주므로 한 fd의 결과가 두 번 올 수 있고(루프가 합침), 기다리는 이벤트가 없는(events=0) fd의 끊김은 알려 주지 않습니다. macOS에서는 `poll`도 이 경우를 알려 주지 않아 동작 차이는 없었습니다.
+- 아직 남은 O(연결 수) 작업: 가장 가까운 마감 찾기, 마감 지난 연결 찾기, 끝난 연결 정리. 다음 단계에서 타이머 힙으로 바꿉니다.
 
 ## 서버 구성
 
@@ -132,6 +139,7 @@ make run PORT=8080
 | 설정 | 기본값 | 동작 |
 |---|---:|---|
 | `workers` | CPU 코어 수(최대 8) | 이벤트 루프 스레드 수 (1~64) |
+| `event_backend` | `auto` | `auto`(Linux `epoll`, macOS `kqueue`), `poll`, `epoll`, `kqueue`. 환경변수 `WEBSERVER_EVENT_BACKEND`가 있으면 설정보다 우선합니다. |
 | `keepalive_timeout_ms` | 5000 | 첫 요청 또는 다음 요청의 첫 바이트를 기다리는 시간 |
 | `header_timeout_ms` | 10000 | 첫 바이트부터 헤더 전체를 받기까지의 시간 |
 | `body_timeout_ms` | 30000 | 헤더를 파싱한 뒤 본문 전체를 받기까지의 시간 |
@@ -147,6 +155,8 @@ make test
 make smoke smoke-dynamic smoke-concurrency
 make asan test-asan
 WEBSERVER=./webserver_asan make smoke-dynamic
+# 같은 테스트를 poll 백엔드로
+WEBSERVER_EVENT_BACKEND=poll make smoke smoke-dynamic smoke-concurrency
 ```
 
 동적 스모크는 20 MiB 응답 중계, 백엔드 전송 완료 전 첫 본문 수신, 느린 클라이언트가 있는 동안의 정적 응답, 고정 길이·`chunked`·EOF 경계, 잘린 응답, 설정으로 바뀐 타임아웃을 확인합니다. 요청 쪽은 chunked 본문(잘게 나눈 전송, 파이프라이닝, CGI·프록시 전달)과 TE·CL 충돌, 지원하지 않는 코딩, 형식 오류, 한도 초과를 확인합니다. 기존 CGI·정적 파일·keep-alive·라운드 로빈 테스트도 함께 실행합니다.
