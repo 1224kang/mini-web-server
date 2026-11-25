@@ -51,6 +51,22 @@ const char *http_get_header(const struct http_request *req, const char *name);
  * 숫자가 아니거나, 오버플로거나, 여러 번 나오면 -1 (→ 400). 정상이면 0. */
 int http_content_length(const struct http_request *req, size_t *out);
 
+/* 요청 본문의 끝을 아는 방법 (RFC 9112 §6.3). */
+enum http_body_kind {
+    HTTP_BODY_NONE,    /* 본문 없음 */
+    HTTP_BODY_LENGTH,  /* Content-Length 바이트만큼 */
+    HTTP_BODY_CHUNKED, /* Transfer-Encoding: chunked, 마지막 0 청크까지 */
+};
+
+/* 요청 헤더로 본문 형식을 정한다. 성공하면 0, 아니면 응답할 상태 코드.
+ *   - Transfer-Encoding 과 Content-Length 가 함께 있음        → 400 (request smuggling 방지)
+ *   - HTTP/1.0 요청에 Transfer-Encoding                       → 400
+ *   - chunked 가 마지막 코딩이 아님, chunked 가 두 번 이상     → 400
+ *   - chunked 외의 코딩(gzip 등)                              → 501
+ *   - Content-Length 형식 오류                                → 400
+ * HTTP_BODY_LENGTH 일 때만 *length 를 채운다. */
+int http_body_framing(const struct http_request *req, enum http_body_kind *kind, size_t *length);
+
 /* 이 요청 뒤에도 연결을 유지하길 클라이언트가 원하는지 (1/0).
  *   HTTP/1.1: 기본 유지. "Connection: close" 가 있으면 끊음.
  *   HTTP/1.0: 기본 끊음. "Connection: keep-alive" 가 있으면 유지.

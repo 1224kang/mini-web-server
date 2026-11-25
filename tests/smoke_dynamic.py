@@ -202,6 +202,116 @@ def test_builtin():
     check("정적 경로에 POST → 405", st == 405, st)
 
 
+# ---------------------------------------------------------------- 요청 본문 Transfer-Encoding
+
+def raw(parts, delay=0.0, timeout=10):
+    """원본 바이트를 (나눠서) 보내고 서버가 닫을 때까지 읽는다. (status, headers, body, 원본)"""
+    s = socket.create_connection(("127.0.0.1", PORT))
+    s.settimeout(timeout)
+    for p in parts:
+        s.sendall(p)
+        if delay:
+            time.sleep(delay)
+    data = b""
+    while True:
+        try:
+            chunk = s.recv(65536)
+        except ConnectionResetError:
+            break
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    st, h, b = parse(data)
+    return st, h, b, data
+
+
+def chunked(body, size):
+    out = b""
+    for i in range(0, len(body), size):
+        piece = body[i:i + size]
+        out += f"{len(piece):x}\r\n".encode() + piece + b"\r\n"
+    return out + b"0\r\n\r\n"
+
+
+def test_request_chunked():
+    head = (b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+            b"Content-Type: text/x-test\r\nConnection: close\r\n\r\n")
+    st, h, b, _ = raw([head + b"5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nX-Trailer: 1\r\n\r\n"])
+    check("chunked 요청 본문 → 내장 echo 가 디코딩된 본문 받음",
+          st == 200 and b == b"hello world" and h.get("content-length") == "11", f"{st} {b!r}")
+
+    # 청크 경계를 가로질러 1~3 바이트씩 나눠 보내기
+    body = chunked(b"abcdefghij" * 3, 7)
+    pieces = [head] + [body[i:i + 3] for i in range(0, len(body), 3)]
+    st, _, b, _ = raw(pieces, delay=0.002)
+    check("chunked 본문을 잘게 나눠 보내도 정확히 조립", st == 200 and b == b"abcdefghij" * 3, f"{st} {b!r}")
+
+    big = os.urandom(300_000)
+    st, _, b, _ = raw([head + chunked(big, 4000)])
+    check("chunked 300KB(청크 75개) 왕복", st == 200 and b == big, f"{st} {len(b)}")
+
+    st, h, b, _ = raw([head + b"0\r\n\r\n"])
+    check("빈 chunked 본문 → Content-Length 0", st == 200 and b == b"" and h.get("content-length") == "0",
+          f"{st} {h}")
+
+    # keep-alive: chunked 요청 뒤에 이어 붙은 요청도 처리
+    s = socket.create_connection(("127.0.0.1", PORT))
+    s.settimeout(10)
+    s.sendall(b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
+              b"3\r\nabc\r\n0\r\n\r\n"
+              b"GET /builtin/add?a=2&b=3 HTTP/1.1\r\nHost: t\r\n\r\n")
+    st1, h1, b1, buf = read_one(s, b"")
+    st2, _, b2, _ = read_one(s, buf)
+    s.close()
+    check("chunked 요청 + 파이프라이닝된 다음 요청",
+          (st1, b1, h1.get("connection"), st2, b2) == (200, b"abc", "keep-alive", 200, b"5\n"),
+          (st1, b1, st2, b2))
+
+    # 헤더가 버퍼를 거의 다 채운 경우: 임시 버퍼로 받고 연결을 닫는다
+    pad = "x" * 7900
+    big_head = (f"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nX-Pad: {pad}\r\n"
+                "Transfer-Encoding: chunked\r\n\r\n").encode()
+    st, h, b, _ = raw([big_head, chunked(b"z" * 5000, 1000)], delay=0.05)
+    check("큰 헤더 + chunked 본문 → 정상 처리 후 연결 닫음",
+          st == 200 and b == b"z" * 5000 and h.get("connection") == "close", f"{st} {len(b)} {h}")
+
+    st, _, b, _ = raw([b"POST /cgi-bin/env HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+                       b"Connection: close\r\n\r\n" + chunked(b"hello cgi", 4)])
+    env = b.decode()
+    check("chunked 본문 → CGI 는 CONTENT_LENGTH 와 stdin 으로 받음",
+          st == 200 and "CONTENT_LENGTH=9" in env.splitlines() and env.rstrip().endswith("hello cgi"),
+          f"{st} {env[-200:]!r}")
+
+    bad = [
+        ("TE + Content-Length → 400", 400,
+         b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n"
+         b"Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"),
+        ("TE: gzip, chunked → 501", 501,
+         b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"),
+        ("TE: chunked, gzip (chunked 가 마지막 아님) → 400", 400,
+         b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"),
+        ("HTTP/1.0 + TE → 400", 400,
+         b"POST /builtin/echo HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+        ("잘못된 청크 길이 → 400", 400,
+         b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"),
+        ("청크 데이터 뒤 CRLF 없음 → 400", 400,
+         b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX"),
+    ]
+    for name, want, data in bad:
+        st, h, _, _ = raw([data])
+        check(name + " (연결 닫음)", st == want and h.get("connection") == "close", f"{st} {h}")
+
+    st, h, _, _ = raw([head + chunked(b"q" * (1024 * 1024 + 1), 65536)])
+    check("chunked 본문 1MB 초과 → 413", st == 413 and h.get("connection") == "close", f"{st} {h}")
+
+    # smuggling 시도: TE 를 무시하는 서버라면 뒤의 GET 을 별도 요청으로 처리한다
+    st, _, _, data = raw([b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+                          b"Content-Length: 4\r\n\r\n0\r\n\r\nGET /builtin/add?a=1&b=1 HTTP/1.1\r\nHost: t\r\n\r\n"])
+    check("smuggling 시도(TE+CL) → 응답은 400 하나뿐", st == 400 and data.count(b"HTTP/1.1 ") == 1,
+          data[:200])
+
+
 # ---------------------------------------------------------------- 6단계: 프록시
 
 def test_proxy_stream():
@@ -338,6 +448,14 @@ def test_proxy(backends):
           st1 == st2 == 200 and h1.get("connection") == "keep-alive"
           and json.loads(b1)["backend"] != json.loads(b2)["backend"], (st1, st2, h1.get("connection")))
 
+    st, _, b, _ = raw([b"POST /api/chunked-req HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+                       b"Connection: close\r\n\r\n" + chunked(b"via proxy", 3)])
+    j = json.loads(b) if st == 200 else {}
+    jh = {k.lower(): v for k, v in j.get("headers", {}).items()}
+    check("chunked 요청 → 백엔드에는 Content-Length 로 전달",
+          j.get("body") == "via proxy" and jh.get("content-length") == "9"
+          and "transfer-encoding" not in jh, f"{st} {j}")
+
     # 백엔드 하나 죽이기
     backends[1].terminate()
     backends[1].wait()
@@ -380,6 +498,7 @@ def main():
         test_cgi_concurrency()
         test_keepalive_mix()
         test_builtin()
+        test_request_chunked()
         test_configured_timeouts()
         test_proxy(backends)
 

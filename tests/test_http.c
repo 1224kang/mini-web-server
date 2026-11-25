@@ -247,6 +247,60 @@ static void test_keep_alive(void)
     CHECK(wants_ka("GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n") == 0);
 }
 
+/* 본문 형식 판정: 반환값(0 또는 상태 코드)과 kind, length */
+static int framing(const char *raw, enum http_body_kind *kind, size_t *len)
+{
+    struct http_request req;
+    char *buf;
+    if (parse(raw, &req, &buf) != HTTP_PARSE_OK) {
+        free(buf);
+        return -1;
+    }
+    int r = http_body_framing(&req, kind, len);
+    free(buf);
+    return r;
+}
+
+static void test_body_framing(void)
+{
+    enum http_body_kind k;
+    size_t n;
+
+    CHECK(framing("GET / HTTP/1.1\r\nHost: a\r\n\r\n", &k, &n) == 0 && k == HTTP_BODY_NONE);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n", &k, &n) == 0 &&
+          k == HTTP_BODY_NONE);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 12\r\n\r\n", &k, &n) == 0 &&
+          k == HTTP_BODY_LENGTH && n == 12);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: x\r\n\r\n", &k, &n) == 400);
+
+    /* chunked: 대소문자, 공백, 빈 목록 항목은 허용 */
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", &k, &n) == 0 &&
+          k == HTTP_BODY_CHUNKED);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding:  Chunked \r\n\r\n", &k, &n) == 0 &&
+          k == HTTP_BODY_CHUNKED);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: , chunked\r\n\r\n", &k, &n) == 0 &&
+          k == HTTP_BODY_CHUNKED);
+
+    /* request smuggling 방지: TE + CL 은 순서와 상관없이 400 */
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n",
+                  &k, &n) == 400);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n",
+                  &k, &n) == 400);
+    /* HTTP/1.0 에는 chunked 가 없다 */
+    CHECK(framing("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n", &k, &n) == 400);
+    /* chunked 가 마지막이 아니거나, 두 번이거나, 비어 있으면 400 */
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", &k, &n) == 400);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n", &k, &n) == 400);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+                  "Transfer-Encoding: chunked\r\n\r\n", &k, &n) == 400);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunkedx\r\n\r\n", &k, &n) == 400);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding:\r\n\r\n", &k, &n) == 400);
+    /* 모르는 코딩 뒤에 chunked: 형식은 맞지만 풀 수 없다 → 501 */
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", &k, &n) == 501);
+    CHECK(framing("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n"
+                  "Transfer-Encoding: chunked\r\n\r\n", &k, &n) == 501);
+}
+
 int main(void)
 {
     struct { const char *name; void (*fn)(void); } tests[] = {
@@ -262,6 +316,7 @@ int main(void)
         { "content_length_validation", test_content_length_validation },
         { "response_head",            test_response_head },
         { "keep_alive",               test_keep_alive },
+        { "body_framing",             test_body_framing },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int before = g_failed;

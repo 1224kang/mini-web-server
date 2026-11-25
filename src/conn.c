@@ -39,7 +39,7 @@
 
 enum conn_state {
     ST_READ_HEAD, /* 요청 헤더를 모으는 중 (len == 0 이면 "다음 요청을 기다리며 노는 중") */
-    ST_READ_BODY, /* Content-Length 만큼 본문을 모으는 중 */
+    ST_READ_BODY, /* Content-Length 만큼, 또는 chunked 의 마지막 청크까지 본문을 모으는 중 */
     ST_UPSTREAM,  /* CGI/백엔드에게 넘기고 답을 기다리는 중 (5·6단계) */
     ST_WRITE,     /* 응답(헤더 + 본문 또는 파일)을 내보내는 중 */
     ST_LINGER,    /* FIN 을 보냈고, 상대가 닫을 때까지 남은 입력을 버리는 중 */
@@ -74,6 +74,10 @@ struct conn {
     size_t consumed;         /* 이번 요청이 buf 에서 차지한 바이트 (응답 후 버림) */
     char *body;
     size_t body_len, body_have;
+    /* Transfer-Encoding: chunked 요청: body 에 디코딩한 본문을 모은다(body_len == body_have) */
+    int body_chunked;
+    size_t body_cap;
+    struct proxy_chunks body_chunks;
 
     /* ---- 보내기 ---- */
     int keep_alive;
@@ -180,7 +184,9 @@ static void release_response(struct conn *c)
     c->chunk_len = c->chunk_sent = 0;
     free(c->body);
     c->body = NULL;
-    c->body_len = c->body_have = 0;
+    c->body_len = c->body_have = c->body_cap = 0;
+    c->body_chunked = 0;
+    c->body_chunks = (struct proxy_chunks){ 0 };
 }
 
 /* 상태를 바꾸는 유일한 곳. 상태가 바뀌면 그 상태의 마감 시각도 반드시 같이 정한다.
@@ -973,6 +979,125 @@ static void dispatch(struct conn *c, long long now)
 /* 받기                                                                 */
 /* ------------------------------------------------------------------ */
 
+/* ---- Transfer-Encoding: chunked 요청 본문 ----
+ *
+ *   "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"  →  body = "hello world" (11 바이트)
+ *
+ * 끝이 어디인지 미리 모르므로 받은 만큼 디코더에 넣고, 디코딩된 바이트만 body 에 붙인다.
+ * 원본 바이트는 buf 의 consumed 뒤에 받아서 그 자리에서 디코딩하므로, 끝난 뒤 남는 바이트
+ * (파이프라이닝된 다음 요청)는 그대로 buf 에 남아 finish_response 가 앞으로 당긴다.
+ * 디코딩이 끝나면 body_len 이 정해지므로 CGI/프록시/내장 핸들러는 Content-Length 요청과
+ * 똑같이 다룬다(프록시는 백엔드에 Content-Length 로 보낸다). */
+
+#define CHUNKED_MIN_ROOM 1024 /* buf 남은 공간이 이보다 작으면 임시 버퍼로 받는다 */
+
+static ssize_t recv_or_close(struct conn *c, void *dst, size_t room);
+
+/* 디코딩된 n 바이트를 body 뒤에 붙인다. 한도를 넘거나 메모리가 없으면 응답까지 하고 -1. */
+static int append_body(struct conn *c, const char *p, size_t n, long long now)
+{
+    if (n == 0)
+        return 0;
+    if (n > HTTP_MAX_BODY - c->body_len) {
+        conn_log(c, "chunked body exceeds %d bytes", HTTP_MAX_BODY);
+        fail(c, 413, now);
+        return -1;
+    }
+    if (c->body_len + n > c->body_cap) {
+        size_t cap = c->body_cap ? c->body_cap : 4096;
+        while (cap < c->body_len + n)
+            cap *= 2;
+        if (cap > HTTP_MAX_BODY)
+            cap = HTTP_MAX_BODY;
+        char *nb = realloc(c->body, cap);
+        if (!nb) {
+            conn_log_errno(c, "realloc");
+            fail(c, 500, now);
+            return -1;
+        }
+        c->body = nb;
+        c->body_cap = cap;
+    }
+    memcpy(c->body + c->body_len, p, n);
+    c->body_len += n;
+    c->body_have = c->body_len;
+    return 0;
+}
+
+/* 원본 바이트 p[0..n) 을 디코딩해 body 에 붙인다.
+ * 1 = 본문 끝(*used 뒤는 다음 요청), 0 = 더 받아야 함(n 전부 소비), -1 = 이미 에러 응답함. */
+static int chunked_input(struct conn *c, char *p, size_t n, size_t *used, long long now)
+{
+    size_t decoded;
+    int done = http_decode_chunks(&c->body_chunks, p, n, &decoded, used);
+    if (done < 0) {
+        conn_log(c, "malformed chunked request body");
+        fail(c, 400, now);
+        return -1;
+    }
+    if (append_body(c, p, decoded, now) < 0)
+        return -1;
+    return done;
+}
+
+/* buf[consumed..len) 에 있는 원본 바이트를 처리한다. 끝까지 받았으면 dispatch. */
+static void feed_chunked_buf(struct conn *c, long long now)
+{
+    size_t used;
+    int done = chunked_input(c, c->buf + c->consumed, c->len - c->consumed, &used, now);
+    if (done < 0)
+        return;
+    c->consumed += used;
+    if (!done) {
+        c->len = c->consumed; /* 처리한 원본은 버리고 그 자리에 다음 조각을 받는다 */
+        return;
+    }
+    conn_log(c, "chunked request body: %zu bytes", c->body_len);
+    dispatch(c, now);
+}
+
+static void start_chunked_body(struct conn *c, size_t head_len, long long now)
+{
+    c->body_chunked = 1;
+    c->body_chunks = (struct proxy_chunks){ 0 };
+    c->consumed = head_len;
+    set_state(c, ST_READ_BODY, now + c->cfg->body_timeout_ms);
+    if (c->len > c->consumed)
+        feed_chunked_buf(c, now); /* 헤더와 함께 딸려 온 본문부터 */
+}
+
+/* ST_READ_BODY + chunked: 받은 원본을 디코딩한다. */
+static void read_chunked_body(struct conn *c, long long now)
+{
+    size_t room = sizeof(c->buf) - c->len;
+    if (room >= CHUNKED_MIN_ROOM) {
+        ssize_t n = recv_or_close(c, c->buf + c->len, room);
+        if (n == 0)
+            conn_log(c, "client closed before finishing chunked body (%zu bytes)", c->body_len);
+        if (n <= 0)
+            return;
+        c->len += (size_t)n;
+        feed_chunked_buf(c, now);
+        return;
+    }
+
+    /* 헤더가 buf 를 거의 다 채웠다. 남는 바이트를 다음 요청으로 보관할 자리가 없으므로
+     * 임시 버퍼로 받고, 이번 응답 뒤에 연결을 닫는다(keep-alive 포기). */
+    char tmp[16 * 1024];
+    c->keep_alive = 0;
+    ssize_t n = recv_or_close(c, tmp, sizeof(tmp));
+    if (n == 0)
+        conn_log(c, "client closed before finishing chunked body (%zu bytes)", c->body_len);
+    if (n <= 0)
+        return;
+    size_t used;
+    int done = chunked_input(c, tmp, (size_t)n, &used, now);
+    if (done == 1) {
+        conn_log(c, "chunked request body: %zu bytes", c->body_len);
+        dispatch(c, now);
+    }
+}
+
 /* 헤더가 완성됐다: 파싱하고, 본문이 더 필요하면 READ_BODY, 아니면 바로 응답. */
 static void process_head(struct conn *c, size_t head_len, long long now)
 {
@@ -996,9 +1121,17 @@ static void process_head(struct conn *c, size_t head_len, long long now)
     conn_log(c, "-> %s %s %s (%zu headers)", c->req.method, c->req.target, c->req.version,
              c->req.header_count);
 
+    enum http_body_kind kind;
     size_t clen;
-    if (http_content_length(&c->req, &clen) < 0) {
-        fail(c, 400, now);
+    int status = http_body_framing(&c->req, &kind, &clen);
+    if (status != 0) {
+        /* 본문 끝을 알 수 없으니 이 연결은 더 쓸 수 없다 → fail 이 keep-alive 를 끈다 */
+        conn_log(c, "bad body framing -> %d", status);
+        fail(c, status, now);
+        return;
+    }
+    if (kind == HTTP_BODY_CHUNKED) {
+        start_chunked_body(c, head_len, now);
         return;
     }
     if (clen > HTTP_MAX_BODY) {
@@ -1079,6 +1212,10 @@ static void on_read_body(struct conn *c, short revents, long long now)
 {
     if (!(revents & (POLLIN | POLLHUP | POLLERR)))
         return;
+    if (c->body_chunked) {
+        read_chunked_body(c, now);
+        return;
+    }
     ssize_t n = recv_or_close(c, c->body + c->body_have, c->body_len - c->body_have);
     if (n == 0)
         conn_log(c, "client closed before sending full body (%zu/%zu)", c->body_have, c->body_len);
