@@ -3,11 +3,11 @@
 <text x="84" y="38" font-size="20" font-weight="600" fill="#0b0b0b">백엔드 1대가 고장 나면 요청이 실패하는가</text>
 <text x="84" y="62" font-size="13" fill="#52514e">리버스 프록시 뒤 백엔드 3대 · 단계마다 요청 300개 · 실패 = 200이 아닌 응답(502·504)</text>
 <rect x="84" y="84" width="12" height="12" rx="2" fill="#2a78d6"/>
-<text x="102" y="95" font-size="13" fill="#0b0b0b">PR #30 이전</text>
-<rect x="228" y="84" width="12" height="12" rx="2" fill="#eb6834"/>
-<text x="246" y="95" font-size="13" fill="#0b0b0b">PR #30 (연결 실패만 우회)</text>
-<rect x="480" y="84" width="12" height="12" rx="2" fill="#1baf7a"/>
-<text x="498" y="95" font-size="13" fill="#0b0b0b">현재 (응답 시간 초과도 우회)</text>
+<text x="102" y="95" font-size="13" fill="#0b0b0b">장애 조치 없음</text>
+<rect x="216" y="84" width="12" height="12" rx="2" fill="#eb6834"/>
+<text x="234" y="95" font-size="13" fill="#0b0b0b">연결 실패만 우회</text>
+<rect x="360" y="84" width="12" height="12" rx="2" fill="#1baf7a"/>
+<text x="378" y="95" font-size="13" fill="#0b0b0b">현재 (응답 없음까지 우회)</text>
 <line x1="84" y1="396.0" x2="820" y2="396.0" stroke="#e4e3df" stroke-width="1"/>
 <text x="74" y="400.0" font-size="12" fill="#52514e" text-anchor="end">0%</text>
 <line x1="84" y1="327.0" x2="820" y2="327.0" stroke="#e4e3df" stroke-width="1"/>

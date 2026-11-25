@@ -16,7 +16,7 @@ from html import escape
 STYLE = {"before": ("#2a78d6", "circle"), "poll": ("#eb6834", "square"),
          "kqueue": ("#1baf7a", "diamond"), "epoll": ("#eda100", "triangle")}
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
-LABELS = {"before": "기존 develop", "poll": "새 루프 + poll",
+LABELS = {"before": "기존 서버", "poll": "새 루프 + poll",
           "kqueue": "새 루프 + kqueue", "epoll": "새 루프 + epoll"}
 
 
@@ -44,8 +44,8 @@ def marker(shape, x, y, color):
 
 
 PHASES = [("normal", "3대 정상"), ("killed", "1대 종료"), ("recovered", "다시 켠 뒤"), ("stopped", "1대 멈춤")]
-FAILOVER = {"before": ("#2a78d6", "PR #30 이전"), "after": ("#eb6834", "PR #30 (연결 실패만 우회)"),
-            "retry": ("#1baf7a", "현재 (응답 시간 초과도 우회)")}
+FAILOVER = {"before": ("#2a78d6", "장애 조치 없음"), "after": ("#eb6834", "연결 실패만 우회"),
+            "retry": ("#1baf7a", "현재 (응답 없음까지 우회)")}
 
 
 def plot_failover(rows, dst):

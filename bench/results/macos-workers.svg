@@ -32,6 +32,6 @@
 <text x="636" y="185.4" font-size="13" font-weight="600" fill="#0b0b0b">새 루프 + kqueue</text>
 <text x="636" y="201.4" font-size="12" fill="#52514e">58,594 req/s</text>
 <circle cx="624.0" cy="215.4" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
-<text x="636" y="219.4" font-size="13" font-weight="600" fill="#0b0b0b">기존 develop</text>
+<text x="636" y="219.4" font-size="13" font-weight="600" fill="#0b0b0b">기존 서버</text>
 <text x="636" y="235.4" font-size="12" fill="#52514e">58,441 req/s</text>
 </svg>
