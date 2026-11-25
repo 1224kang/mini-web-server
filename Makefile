@@ -8,7 +8,7 @@ MODE    ?= release
 PORT    ?= 18080
 SRCS    := src/main.c src/server.c src/http.c src/static_files.c src/conn.c \
            src/config.c src/cgi.c src/upstream.c src/builtin.c \
-           src/event.c src/event_poll.c src/event_epoll.c src/event_kqueue.c
+           src/event.c src/event_poll.c src/event_epoll.c src/event_kqueue.c src/timer.c
 OBJ_DIR := build/$(MODE)
 OBJS    := $(SRCS:src/%.c=$(OBJ_DIR)/%.o)
 
@@ -26,7 +26,7 @@ TARGET   := webserver
 TEST_DIR := tests
 endif
 
-TEST_BIN := $(addprefix $(TEST_DIR)/,test_http test_static test_dynamic)
+TEST_BIN := $(addprefix $(TEST_DIR)/,test_http test_static test_dynamic test_timer)
 
 .PHONY: all clean run run-proxy backends asan tsan test test-asan smoke smoke-concurrency smoke-dynamic
 
@@ -48,6 +48,7 @@ test: $(TEST_BIN)
 	./$(TEST_DIR)/test_http
 	./$(TEST_DIR)/test_static
 	./$(TEST_DIR)/test_dynamic
+	./$(TEST_DIR)/test_timer
 
 $(TEST_DIR)/test_http: tests/test_http.c src/http.c src/http.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -Isrc -o $@ $(filter %.c,$^)
@@ -56,6 +57,9 @@ $(TEST_DIR)/test_static: tests/test_static.c src/static_files.c src/static_files
 	$(CC) $(CFLAGS) -Isrc -o $@ $(filter %.c,$^)
 
 $(TEST_DIR)/test_dynamic: tests/test_dynamic.c src/upstream.c src/builtin.c src/config.c src/http.c $(HDRS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -Isrc -o $@ $(filter %.c,$^)
+
+$(TEST_DIR)/test_timer: tests/test_timer.c src/timer.c src/timer.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -Isrc -o $@ $(filter %.c,$^)
 
 # 실제 서버를 띄워 curl 로 정적 파일 서빙을 확인한다.
@@ -93,5 +97,5 @@ test-asan:
 	$(MAKE) MODE=asan test
 
 clean:
-	rm -f $(SRCS:.c=.o) webserver webserver_asan webserver_tsan tests/test_http tests/test_static tests/test_dynamic
+	rm -f $(SRCS:.c=.o) webserver webserver_asan webserver_tsan tests/test_http tests/test_static tests/test_dynamic tests/test_timer
 	rm -rf build/release build/asan build/tsan

@@ -2,6 +2,7 @@
 #include "cgi.h"
 #include "conn.h"
 #include "event.h"
+#include "timer.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -11,6 +12,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h> /* offsetof */
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,8 +42,11 @@
  *   - 연결이 기다리는 fd/이벤트가 바뀔 수 있는 때는 그 연결을 건드린 직후뿐이다
  *     (conn_new, conn_handle, conn_timeout, conn_shutdown). 그때만 watch_sync 로 등록을 맞춘다.
  *   - 이벤트가 오면 ptr(= struct watch)로 바로 그 연결을 찾는다. 배열을 훑지 않는다.
- * 그래서 poller 를 epoll/kqueue 로 바꾸면 "준비된 연결만" 다루게 된다.
- * (마감 확인과 정리는 아직 모든 연결을 훑는다 → 다음 단계에서 타이머 힙으로 바꾼다)
+ * 마감은 타이머 힙(timer.h)에 둔다. 연결을 건드린 직후 그 연결의 새 마감으로 힙 자리를 옮긴다.
+ *   - 얼마나 잘지: 힙 맨 위 하나만 본다.
+ *   - 마감 지난 연결: 힙 맨 위에서 지난 것만 꺼낸다.
+ * 끝난 연결도 건드린 직후에만 생기므로(conn_done), 그때 정리 목록에 넣고 바퀴 끝에 푼다.
+ * 그래서 epoll/kqueue 에서는 한 바퀴의 일이 연결 수가 아니라 "일이 생긴 연결 수"에 비례한다.
  */
 
 #define BACKLOG 128
@@ -131,16 +136,21 @@ struct handoff {
 struct server;
 struct loop;
 
-/* 연결 하나와, 그 연결이 지금 poller 에 등록해 둔 fd 들.
+/* 연결 하나와, 그 연결이 지금 poller 에 등록해 둔 fd 들과 마감.
  * poller 에 넘기는 ptr 이 이 구조체라서, 이벤트가 오면 바로 연결을 찾는다. */
 struct watch {
     struct conn *c;
     struct loop *L;
+    int idx;                         /* L->watches 안 위치 (O(1)로 빼려고) */
     struct pollfd reg[CONN_MAX_FDS]; /* 마지막으로 맞춘 conn_pollfds 결과 = poller 에 등록된 것 */
     int nreg;
     short got[CONN_MAX_FDS];         /* 이번 바퀴에 reg[k] 에 온 이벤트 */
     unsigned long ready_round;       /* 이번 바퀴 준비 목록에 이미 넣었으면 그 바퀴 번호 */
+    struct timer_node timer;         /* 타이머 힙 노드: when = conn_deadline */
+    int dying;                       /* 끝남: 정리 목록에 들어 있음 */
 };
+
+#define WATCH_OF_TIMER(t) ((struct watch *)((char *)(t) - offsetof(struct watch, timer)))
 
 struct loop {
     int index;                /* 로그용 번호: [loop1], [loop2], ... */
@@ -161,6 +171,10 @@ struct loop {
     int max_events;
     struct watch **ready;     /* 이번 바퀴에 이벤트가 온 연결들 */
     unsigned long round;      /* 바퀴 번호 (ready_round 와 비교) */
+    struct timer_heap timers; /* 연결들의 마감 */
+    struct watch **expired;   /* 이번 바퀴에 마감이 지난 연결들 */
+    struct watch **dying;     /* 이번 바퀴에 끝난 연결들 (바퀴 끝에 푼다) */
+    int ndying;
 };
 
 struct server {
@@ -249,6 +263,26 @@ static void on_conn_close_fd(void *ctx, int fd)
     }
 }
 
+/* 연결을 건드린 직후(conn_new/handle/timeout/shutdown) 부른다. 바뀔 수 있는 것은 이때만 바뀐다.
+ *   - 기다리는 fd → poller 등록 맞추기
+ *   - 마감       → 타이머 힙 자리 옮기기
+ *   - 끝났는지    → 끝났으면 정리 목록에 넣기 (바퀴 끝에 푼다: 이번 바퀴의 목록들이 아직 가리킬 수 있음) */
+static void watch_touched(struct watch *w)
+{
+    struct loop *L = w->L;
+    watch_sync(w);
+    if (conn_done(w->c)) {
+        timer_remove(&L->timers, &w->timer);
+        if (!w->dying) {
+            w->dying = 1;
+            L->dying[L->ndying++] = w;
+        }
+    } else {
+        /* 힙 공간은 loop_init 에서 연결 한도만큼 미리 잡아 둬서 실패하지 않는다 */
+        timer_set(&L->timers, &w->timer, conn_deadline(w->c));
+    }
+}
+
 /* inbox 에 쌓인 연결을 한꺼번에 꺼내 이 루프의 연결로 만든다. */
 static void adopt_new(struct loop *L, long long now, int stopping)
 {
@@ -271,13 +305,15 @@ static void adopt_new(struct loop *L, long long now, int stopping)
         } else {
             w->c = c;
             w->L = L;
+            timer_node_init(&w->timer);
             conn_set_close_hook(c, on_conn_close_fd, w);
+            w->idx = L->nconns;
             L->watches[L->nconns++] = w;
             printf("[loop%d] accepted %s:%d as c%lu (open: %d)\n", L->index, h->ip, h->port, h->id,
                    L->nconns);
             if (stopping) /* 종료 직전에 넘겨받은 연결: 요청이 없으면 바로 닫힌다 */
                 conn_shutdown(c, now);
-            watch_sync(w);
+            watch_touched(w);
         }
         free(h);
         h = next;
@@ -292,30 +328,22 @@ static int inbox_empty(struct loop *L)
     return empty;
 }
 
-/* 연결 하나를 정리한다: 남은 등록을 지우고, 닫고, 푼다. */
+/* 연결 하나를 정리한다: 남은 등록과 마감을 지우고, 닫고, 풀고, 목록에서 뺀다(맨 뒤로 메움). */
 static void watch_free(struct watch *w)
 {
     struct loop *L = w->L;
     for (int k = 0; k < w->nreg; k++)
         poller_del(L->poller, w->reg[k].fd);
     w->nreg = 0;
+    timer_remove(&L->timers, &w->timer);
     conn_free(w->c); /* 닫는 fd 는 이미 등록에서 빠졌으므로 훅은 할 일이 없다 */
+
+    struct watch *last = L->watches[--L->nconns];
+    L->watches[w->idx] = last;
+    last->idx = w->idx;
     free(w);
     atomic_fetch_sub(&L->open, 1);
     atomic_fetch_sub(&L->srv->open_total, 1);
-}
-
-/* 끝난 연결을 정리한다. 배열 중간을 지울 땐 맨 뒤 원소로 메운다(O(1), 순서는 상관없음). */
-static void sweep(struct loop *L)
-{
-    for (int i = 0; i < L->nconns;) {
-        if (conn_done(L->watches[i]->c)) {
-            watch_free(L->watches[i]);
-            L->watches[i] = L->watches[--L->nconns];
-        } else {
-            i++;
-        }
-    }
 }
 
 static void *loop_main(void *arg)
@@ -338,21 +366,15 @@ static void *loop_main(void *arg)
             break;
         long long now = now_ms();
 
-        /* ---- 1) 가장 가까운 마감 찾기 (아직은 모든 연결을 훑는다) ---- */
-        long long next_deadline = LLONG_MAX;
-        int n = L->nconns; /* 이번 바퀴에서 다룰 연결 수 (도중에 받은 건 다음 바퀴에) */
-        for (int i = 0; i < n; i++) {
-            long long d = conn_deadline(L->watches[i]->c);
-            if (d < next_deadline)
-                next_deadline = d;
+        /* ---- 1) 가장 가까운 마감 = 타이머 힙 맨 위 ---- */
+        int timeout = -1;
+        struct timer_node *top = timer_top(&L->timers);
+        if (top) {
+            long long left = top->when - now;
+            timeout = left <= 0 ? 0 : left > INT_MAX ? INT_MAX : (int)left;
         }
 
         /* ---- 2) 무언가 일어나거나, 가장 가까운 마감이 될 때까지 잠든다 ---- */
-        int timeout = -1;
-        if (next_deadline != LLONG_MAX) {
-            long long left = next_deadline - now;
-            timeout = left <= 0 ? 0 : left > INT_MAX ? INT_MAX : (int)left;
-        }
         int nev = poller_wait(L->poller, L->events, L->max_events, timeout);
         if (nev < 0) {
             if (errno == EINTR)
@@ -362,6 +384,7 @@ static void *loop_main(void *arg)
         }
         now = now_ms();
         L->round++;
+        L->ndying = 0;
 
         /* ---- 3) 온 이벤트를 연결별로 모은다 (CGI 는 fd 가 여러 개라 한 연결에 이벤트가 여럿 올 수 있다) ---- */
         int nready = 0, woke = 0, stop = 0, reap = 0;
@@ -394,16 +417,20 @@ static void *loop_main(void *arg)
                 pfds[k] = (struct pollfd){ .fd = w->reg[k].fd, .events = w->reg[k].events,
                                            .revents = w->got[k] };
             conn_handle(w->c, pfds, w->nreg, now);
-            watch_sync(w);
+            watch_touched(w);
         }
 
-        /* ---- 5) 마감이 지난 연결 (아직은 모든 연결을 훑는다) ---- */
-        for (int i = 0; i < n; i++) {
-            struct watch *w = L->watches[i];
-            if (!conn_done(w->c) && conn_deadline(w->c) <= now) {
-                conn_timeout(w->c, now);
-                watch_sync(w);
-            }
+        /* ---- 5) 마감이 지난 연결: 힙 맨 위에서 지난 것만 꺼낸다 ----
+         * 먼저 전부 꺼내 두고 나서 conn_timeout 을 부른다. 바로 부르면, 마감을 안 바꾸는 연결이
+         * 다시 맨 위로 올라와 이 바퀴 안에서 끝없이 반복될 수 있다. */
+        int nexp = 0;
+        while ((top = timer_top(&L->timers)) && top->when <= now) {
+            timer_remove(&L->timers, top);
+            L->expired[nexp++] = WATCH_OF_TIMER(top);
+        }
+        for (int i = 0; i < nexp; i++) {
+            conn_timeout(L->expired[i]->c, now);
+            watch_touched(L->expired[i]);
         }
 
         /* ---- 5.5) 끝난 CGI 자식 거두기 (좀비 방지) ---- */
@@ -416,9 +443,12 @@ static void *loop_main(void *arg)
             /* 종료 파이프는 한 번 울리면 계속 "읽을 수 있음"이다(모든 스레드에게 알리려고 비우지 않음).
              * 등록해 둔 채로 두면 매번 즉시 깨어나 헛돈다 → 뺀다. */
             poller_del(L->poller, S->stop_fd);
-            for (int i = 0; i < L->nconns; i++) {
-                conn_shutdown(L->watches[i]->c, now);
-                watch_sync(L->watches[i]);
+            for (int i = 0; i < L->nconns; i++) { /* 종료 때 한 번뿐이라 전부 훑어도 된다 */
+                struct watch *w = L->watches[i];
+                if (w->dying)
+                    continue;
+                conn_shutdown(w->c, now);
+                watch_touched(w);
             }
         }
 
@@ -428,13 +458,14 @@ static void *loop_main(void *arg)
             adopt_new(L, now, stopping);
         }
 
-        /* ---- 8) 끝난 연결 정리 (아직은 모든 연결을 훑는다) ---- */
-        sweep(L);
+        /* ---- 8) 이번 바퀴에 끝난 연결만 정리한다 ---- */
+        for (int i = 0; i < L->ndying; i++)
+            watch_free(L->dying[i]);
+        L->ndying = 0;
     }
 
-    for (int i = 0; i < L->nconns; i++) /* poller 오류로 나온 경우 */
-        watch_free(L->watches[i]);
-    L->nconns = 0;
+    while (L->nconns > 0) /* poller 오류로 나온 경우 */
+        watch_free(L->watches[L->nconns - 1]);
     return NULL;
 }
 
@@ -551,6 +582,9 @@ static void loop_destroy(struct loop *L)
     free(L->watches);
     free(L->events);
     free(L->ready);
+    free(L->expired);
+    free(L->dying);
+    timer_heap_free(&L->timers);
 }
 
 static int loop_init(struct loop *L, struct server *S, int index)
@@ -568,7 +602,10 @@ static int loop_init(struct loop *L, struct server *S, int index)
     L->watches = calloc(max, sizeof(*L->watches));
     L->events = calloc((size_t)L->max_events, sizeof(*L->events));
     L->ready = calloc(max, sizeof(*L->ready));
-    if (!L->poller || !L->watches || !L->events || !L->ready || make_pipe(L->wake) < 0) {
+    L->expired = calloc(max, sizeof(*L->expired));
+    L->dying = calloc(max, sizeof(*L->dying));
+    if (!L->poller || !L->watches || !L->events || !L->ready || !L->expired || !L->dying ||
+        timer_heap_reserve(&L->timers, (int)max) < 0 || make_pipe(L->wake) < 0) {
         perror("loop init");
         return -1;
     }
