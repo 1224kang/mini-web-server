@@ -2,4 +2,5 @@ webserver
 *.o
 tests/test_http
 tests/test_static
+tests/test_dynamic
 *.dSYM/

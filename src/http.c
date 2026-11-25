@@ -224,9 +224,15 @@ const char *http_reason(int status)
 {
     switch (status) {
     case 200: return "OK";
+    case 201: return "Created";
+    case 204: return "No Content";
     case 301: return "Moved Permanently";
+    case 302: return "Found";
+    case 303: return "See Other";
+    case 304: return "Not Modified";
     case 400: return "Bad Request";
     case 403: return "Forbidden";
+    case 401: return "Unauthorized";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 408: return "Request Timeout";
@@ -234,7 +240,9 @@ const char *http_reason(int status)
     case 414: return "URI Too Long";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
+    case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
     case 505: return "HTTP Version Not Supported";
     default:  return "Unknown";
     }

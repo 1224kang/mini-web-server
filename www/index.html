@@ -16,6 +16,13 @@
       <li><a href="/docs">/docs (슬래시 없음 → 301)</a></li>
       <li><a href="/nope.html">/nope.html (404)</a></li>
     </ul>
+    <h2>5단계: 동적 처리</h2>
+    <ul>
+      <li><a href="/cgi-bin/add?a=1&amp;b=2">/cgi-bin/add?a=1&amp;b=2</a> (CGI: fork + exec 한 셸 스크립트)</li>
+      <li><a href="/builtin/add?a=1&amp;b=2">/builtin/add?a=1&amp;b=2</a> (내장 핸들러: 프로세스 없이 서버 안에서)</li>
+      <li><a href="/form.html">/form.html</a> (POST 폼 → /cgi-bin/form 이 stdin 으로 받음)</li>
+      <li><a href="/cgi-bin/env?x=1">/cgi-bin/env?x=1</a> (서버가 CGI 에게 준 환경변수)</li>
+    </ul>
   </main>
   <script src="/js/app.js"></script>
 </body>

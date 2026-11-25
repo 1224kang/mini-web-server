@@ -1,4 +1,5 @@
 #include "server.h"
+#include "cgi.h"
 #include "conn.h"
 
 #include <arpa/inet.h>
@@ -17,7 +18,7 @@
  * 단일 스레드 이벤트 루프.
  *
  *   for (;;) {
- *       poll([listen, stop, 연결1, 연결2, ...], 가장 가까운 마감까지)
+ *       poll([listen, stop, 자식회수, 연결1(+CGI 파이프), ...], 가장 가까운 마감까지)
  *       준비된 연결마다 conn_handle()  ← 할 수 있는 만큼만 하고 즉시 돌아온다
  *       마감 지난 연결마다 conn_timeout()
  *       새 연결 accept, 끝난 연결 정리
@@ -40,6 +41,9 @@ int server_listen(int port)
 
     /* SO_REUSEADDR: 서버를 껐다 바로 켰을 때 이전 연결이 TIME_WAIT 상태로
      * 포트를 잡고 있어도 bind 가 "Address already in use" 로 실패하지 않게 한다. */
+    /* FD_CLOEXEC: CGI 를 exec 할 때 자식에게 listen 소켓이 새지 않게 */
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+
     int opt = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt");
@@ -100,7 +104,7 @@ void server_reject_busy(int client_fd)
 }
 
 struct loop {
-    const char *docroot; //정적 파일을 찾을 폴더 경로 
+    struct server_config *cfg; //docroot, CGI 설정
     int listen_fd; //listen 소켓의 fd 
     int max_conns; //동시에 열어 둘 수 있는 최대 연결 수 
     struct conn **conns; /* 살아 있는 연결들 (순서 없음) */
@@ -135,6 +139,9 @@ static void accept_new(struct loop *L, long long now)
          * 그 recv/send 에서 루프 전체(= 모든 연결)가 멈춘다.
          * (macOS 는 listen 소켓의 O_NONBLOCK 을 물려주지만 Linux 는 아니므로 직접 켠다) */
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        /* CGI 자식이 이 소켓을 물려받으면, 우리가 close 해도 자식이 쥐고 있어서
+         * 클라이언트는 연결이 끝난 걸 모른다 → exec 때 자동으로 닫히게. */
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
 
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client.sin_addr, ip, sizeof(ip));
@@ -146,7 +153,7 @@ static void accept_new(struct loop *L, long long now)
             server_reject_busy(fd);
             continue;
         }
-        struct conn *c = conn_new(fd, ++L->next_id, L->docroot, now);
+        struct conn *c = conn_new(fd, ++L->next_id, L->cfg, ip, ntohs(client.sin_port), now);
         if (!c) {
             close(fd);
             continue;
@@ -170,23 +177,29 @@ static void sweep(struct loop *L)
     }
 }
 
-int server_run(int listen_fd, int stop_fd, const char *docroot, int max_conns,
+int server_run(int listen_fd, int stop_fd, struct server_config *cfg, int max_conns,
                struct server_stats *stats)
 {
     struct loop L = {
-        .docroot = docroot,
+        .cfg = cfg,
         .listen_fd = listen_fd,
         .max_conns = max_conns,
     };
-    /* poll 배열: [listen][stop][연결 0][연결 1]... */
+    /* poll 배열: [listen][stop][reap][연결 0 의 fd 1~3개][연결 1 의 fd 1~3개]...
+     * 연결마다 fd 수가 달라서(정적 파일 1개, CGI 최대 3개) 각 연결의 시작 칸과 칸 수를 따로 적는다. */
     L.conns = calloc((size_t)max_conns, sizeof(*L.conns));
-    struct pollfd *pfds = calloc((size_t)max_conns + 2, sizeof(*pfds));
-    if (!L.conns || !pfds) {
+    struct pollfd *pfds = calloc((size_t)max_conns * CONN_MAX_FDS + 3, sizeof(*pfds));
+    int *first = calloc((size_t)max_conns, sizeof(*first));
+    int *count = calloc((size_t)max_conns, sizeof(*count));
+    if (!L.conns || !pfds || !first || !count) {
         perror("calloc");
         free(L.conns);
         free(pfds);
+        free(first);
+        free(count);
         return -1;
     }
+    int reap_fd = cgi_reaper_fd();
 
     /* 이벤트가 왔다고 accept 했는데 그 사이 클라이언트가 RST 로 사라지면
      * 블로킹 accept 는 다음 손님이 올 때까지 루프를 멈춘다 → non-blocking. */
@@ -213,10 +226,15 @@ int server_run(int listen_fd, int stop_fd, const char *docroot, int max_conns,
             stop_idx = np; //마감 벨. 
             pfds[np++] = (struct pollfd){ .fd = stop_fd, .events = POLLIN };
         }
-        int base = np; // 클라이언트 소켓이 시작하는 칸 번호 
+        /* SIGCHLD → 파이프. 종료 중에도 CGI 자식은 거둬야 하므로 항상 넣는다(읽어서 비우므로 헛돌지 않음). */
+        int reap_idx = np;
+        pfds[np++] = (struct pollfd){ .fd = reap_fd, .events = POLLIN };
+
         int n = L.nconns; /* 이번 바퀴에서 다룰 연결 수 (도중에 accept 된 건 다음 바퀴에) */
         for (int i = 0; i < n; i++) {
-            pfds[np++] = (struct pollfd){ .fd = conn_fd(L.conns[i]), .events = conn_events(L.conns[i]) };
+            first[i] = np;
+            count[i] = conn_pollfds(L.conns[i], &pfds[np]);
+            np += count[i];
             long long d = conn_deadline(L.conns[i]);
             if (d < next_deadline)
                 next_deadline = d;
@@ -242,11 +260,18 @@ int server_run(int listen_fd, int stop_fd, const char *docroot, int max_conns,
         /* ---- 3) 준비된 연결을 하나씩 "조금씩" 진행시킨다 ---- */
         for (int i = 0; i < n; i++) {
             struct conn *c = L.conns[i];
-            if (pfds[base + i].revents) //손님 i 벨이 울렸을 때 
-                conn_handle(c, pfds[base + i].revents, now);
+            int ready = 0;
+            for (int k = 0; k < count[i]; k++)
+                ready |= pfds[first[i] + k].revents != 0;
+            if (ready) //연결 i 의 fd 중 하나라도 이벤트가 있으면
+                conn_handle(c, &pfds[first[i]], count[i], now);
             if (!conn_done(c) && conn_deadline(c) <= now)
                 conn_timeout(c, now);
         }
+
+        /* ---- 3.5) 끝난 CGI 자식 거두기 (좀비 방지) ---- */
+        if (pfds[reap_idx].revents)
+            cgi_reap();
 
         /* ---- 4) 종료 신호 ---- */
         if (stop_idx >= 0 && pfds[stop_idx].revents) {
@@ -271,6 +296,9 @@ int server_run(int listen_fd, int stop_fd, const char *docroot, int max_conns,
         conn_free(L.conns[i]);
     free(L.conns);
     free(pfds);
+    free(first);
+    free(count);
+    cgi_reap();
 
     stats->connections = L.next_id;
     stats->requests = conn_total_requests();

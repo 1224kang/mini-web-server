@@ -1,0 +1,26 @@
+#!/bin/sh
+# GET /cgi-bin/add?a=1&b=2  →  3
+#
+# CGI 규칙: 요청 정보는 환경변수로 들어오고(QUERY_STRING 등),
+#           stdout 에 "헤더 줄들 + 빈 줄 + 본문"을 쓰면 서버가 HTTP 응답으로 바꿔 준다.
+# 셸 스크립트든 파이썬이든 C 프로그램이든 "실행 파일"이면 된다.
+
+a=""; b=""
+IFS='&'
+for kv in $QUERY_STRING; do
+    case "$kv" in
+        a=*) a="${kv#a=}" ;;
+        b=*) b="${kv#b=}" ;;
+    esac
+done
+
+is_int() { case "$1" in ''|*[!0-9-]*|?*-*) return 1 ;; esac; [ "$1" != "-" ]; }
+
+if is_int "$a" && is_int "$b"; then
+    printf 'Content-Type: text/plain; charset=utf-8\r\n\r\n'
+    echo $((a + b))
+else
+    printf 'Status: 400 Bad Request\r\n'
+    printf 'Content-Type: text/plain; charset=utf-8\r\n\r\n'
+    echo "usage: /cgi-bin/add?a=<integer>&b=<integer>"
+fi
