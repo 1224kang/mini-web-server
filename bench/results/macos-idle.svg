@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="500" viewBox="0 0 860 500" font-family="-apple-system, 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif">
+<rect width="860" height="500" fill="#fcfcfb"/>
+<text x="84" y="38" font-size="20" font-weight="600" fill="#0b0b0b">노는 연결이 늘어도 처리량이 유지되는가</text>
+<text x="84" y="62" font-size="13" fill="#52514e">루프 1개, 활성 연결 50개로 측정 · 다른 연결 수천 개가 keep-alive로 대기 중</text>
+<line x1="84" y1="430.0" x2="610" y2="430.0" stroke="#e4e3df" stroke-width="1"/>
+0</text>
+<line x1="84" y1="346.5" x2="610" y2="346.5" stroke="#e4e3df" stroke-width="1"/>
+<text x="74" y="350.5" font-size="12" fill="#52514e" text-anchor="end">12.5k</text>
+<line x1="84" y1="263.0" x2="610" y2="263.0" stroke="#e4e3df" stroke-width="1"/>
+<text x="74" y="267.0" font-size="12" fill="#52514e" text-anchor="end">25k</text>
+<line x1="84" y1="179.5" x2="610" y2="179.5" stroke="#e4e3df" stroke-width="1"/>
+<text x="74" y="183.5" font-size="12" fill="#52514e" text-anchor="end">37.5k</text>
+<line x1="84" y1="96.0" x2="610" y2="96.0" stroke="#e4e3df" stroke-width="1"/>
+<text x="74" y="100.0" font-size="12" fill="#52514e" text-anchor="end">50k</text>
+<text x="22" y="263.0" font-size="12" fill="#52514e" text-anchor="middle" transform="rotate(-90 22 263.0)">초당 처리 요청 수 (req/s)</text>
+<text x="84.0" y="452" font-size="12" fill="#52514e" text-anchor="middle">0</text>
+<text x="142.4" y="452" font-size="12" fill="#52514e" text-anchor="middle">1,000</text>
+<text x="230.1" y="452" font-size="12" fill="#52514e" text-anchor="middle">2,500</text>
+<text x="376.2" y="452" font-size="12" fill="#52514e" text-anchor="middle">5,000</text>
+<text x="610.0" y="452" font-size="12" fill="#52514e" text-anchor="middle">9,000</text>
+<text x="347.0" y="482" font-size="12" fill="#52514e" text-anchor="middle">대기 중인(노는) 연결 수</text>
+<polyline points="84.0,147.9 142.4,184.3 230.1,249.4 376.2,293.4 610.0,339.6" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="84.0" cy="147.9" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="142.4" cy="184.3" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="230.1" cy="249.4" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="376.2" cy="293.4" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="610.0" cy="339.6" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="84.0,148.3 142.4,182.4 230.1,243.1 376.2,290.9 610.0,335.6" fill="none" stroke="#eb6834" stroke-width="2" stroke-linejoin="round"/>
+<rect x="79.5" y="143.8" width="9.0" height="9.0" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<rect x="137.9" y="177.9" width="9.0" height="9.0" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<rect x="225.6" y="238.6" width="9.0" height="9.0" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<rect x="371.7" y="286.4" width="9.0" height="9.0" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<rect x="605.5" y="331.1" width="9.0" height="9.0" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="84.0,142.7 142.4,142.7 230.1,145.3 376.2,149.2 610.0,151.7" fill="none" stroke="#1baf7a" stroke-width="2" stroke-linejoin="round"/>
+<path d="M84.0,136.8 L89.8,142.7 L84.0,148.5 L78.2,142.7Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M142.4,136.8 L148.3,142.7 L142.4,148.5 L136.6,142.7Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M230.1,139.5 L236.0,145.3 L230.1,151.2 L224.3,145.3Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M376.2,143.3 L382.1,149.2 L376.2,155.0 L370.4,149.2Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M610.0,145.8 L615.9,151.7 L610.0,157.5 L604.1,151.7Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M624.0,141.8 L629.9,147.7 L624.0,153.5 L618.1,147.7Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="636" y="151.7" font-size="13" font-weight="600" fill="#0b0b0b">새 루프 + kqueue</text>
+<text x="636" y="167.7" font-size="12" fill="#52514e">41,667 req/s</text>
+<rect x="619.5" y="327.1" width="9.0" height="9.0" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="636" y="335.6" font-size="13" font-weight="600" fill="#0b0b0b">새 루프 + poll</text>
+<text x="636" y="351.6" font-size="12" fill="#52514e">14,135 req/s</text>
+<circle cx="624.0" cy="365.6" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="636" y="369.6" font-size="13" font-weight="600" fill="#0b0b0b">기존 develop</text>
+<text x="636" y="385.6" font-size="12" fill="#52514e">13,536 req/s</text>
+</svg>
