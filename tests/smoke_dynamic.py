@@ -339,10 +339,11 @@ def test_proxy(backends):
           st1 == st2 == 200 and h1.get("connection") == "keep-alive"
           and json.loads(b1)["backend"] != json.loads(b2)["backend"], (st1, st2, h1.get("connection")))
 
-    # 백엔드 하나 죽이기 → 장애 조치: 연결 거부된 백엔드는 down 표시 + 다른 백엔드로 재시도
-    dead = f"b{BACKEND_PORTS[1]}"
+    # 백엔드 하나 죽이기
     backends[1].terminate()
     backends[1].wait()
+    # 장애 조치: 연결 거부된 백엔드는 down 표시 + 다른 백엔드로 재시도
+    dead = f"b{BACKEND_PORTS[1]}"
     got = [request("GET", "/api/dead") for _ in range(6)]
     codes = [g[0] for g in got]
     seen = [json.loads(g[2])["backend"] for g in got if g[0] == 200]
