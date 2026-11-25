@@ -5,6 +5,7 @@
     python3 bench/plot.py bench/results/macos-workers.csv bench/results/macos-workers.svg
 
 idle CSV 는 x = 노는 연결 수, workers CSV 는 x = 이벤트 루프 수. y 는 초당 처리 요청 수.
+failover.py 의 CSV(phase 열이 있음)는 단계별 실패 비율 막대그래프로 그린다.
 """
 import csv
 import sys
@@ -42,9 +43,75 @@ def marker(shape, x, y, color):
     return f'<path d="M{x:.1f},{y - d:.1f} L{x + d:.1f},{y + d * 0.8:.1f} L{x - d:.1f},{y + d * 0.8:.1f}Z" fill="{color}" {ring}/>'
 
 
+PHASES = [("normal", "3대 정상"), ("killed", "1대 종료"), ("recovered", "다시 켠 뒤"), ("stopped", "1대 멈춤")]
+FAILOVER = {"before": ("#2a78d6", "PR #30 이전"), "after": ("#eb6834", "PR #30 (연결 실패만 우회)"),
+            "retry": ("#1baf7a", "현재 (응답 시간 초과도 우회)")}
+
+
+def plot_failover(rows, dst):
+    """단계마다 두 서버의 실패 비율(200 이 아닌 응답) 막대. 막대 위에 값을 적는다."""
+    series = []
+    for r in rows:
+        if r["series"] not in series:
+            series.append(r["series"])
+    val = {(r["series"], r["phase"]): float(r["fail_pct"]) for r in rows}
+    W, H = 860, 460
+    left, right, top, bottom = 84, 40, 120, 64
+    pw, ph = W - left - right, H - top - bottom
+    ymax = 40.0
+
+    def py(v):
+        return top + ph * (1 - v / ymax)
+
+    o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
+         f'font-family="-apple-system, \'Apple SD Gothic Neo\', \'Noto Sans KR\', sans-serif">',
+         f'<rect width="{W}" height="{H}" fill="{SURFACE}"/>',
+         f'<text x="{left}" y="38" font-size="20" font-weight="600" fill="{INK}">백엔드 1대가 고장 나면 요청이 실패하는가</text>',
+         f'<text x="{left}" y="62" font-size="13" fill="{INK2}">리버스 프록시 뒤 백엔드 3대 · 단계마다 요청 300개 · '
+         f'실패 = 200이 아닌 응답(502·504)</text>']
+    lx = left
+    for s in series:  # 범례
+        color, label = FAILOVER.get(s, ("#52514e", s))
+        o.append(f'<rect x="{lx}" y="84" width="12" height="12" rx="2" fill="{color}"/>')
+        o.append(f'<text x="{lx + 18}" y="95" font-size="13" fill="{INK}">{escape(label)}</text>')
+        lx += 36 + 12 * len(label)
+    for i in range(5):
+        v = ymax * i / 4
+        y = py(v)
+        o.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + pw}" y2="{y:.1f}" stroke="{GRID}" stroke-width="1"/>')
+        o.append(f'<text x="{left - 10}" y="{y + 4:.1f}" font-size="12" fill="{INK2}" text-anchor="end">{v:g}%</text>')
+    o.append(f'<text x="22" y="{top + ph / 2:.1f}" font-size="12" fill="{INK2}" text-anchor="middle" '
+             f'transform="rotate(-90 22 {top + ph / 2:.1f})">실패한 요청 비율</text>')
+    group = pw / len(PHASES)
+    bw, gap = 24, 2
+    for gi, (phase, label) in enumerate(PHASES):
+        cx = left + group * (gi + 0.5)
+        o.append(f'<text x="{cx:.1f}" y="{top + ph + 24}" font-size="13" fill="{INK2}" text-anchor="middle">{escape(label)}</text>')
+        total = len(series) * bw + (len(series) - 1) * gap
+        for si, s in enumerate(series):
+            v = val.get((s, phase))
+            if v is None:
+                continue
+            color = FAILOVER.get(s, ("#52514e", s))[0]
+            x = cx - total / 2 + si * (bw + gap)
+            y = py(v)
+            h = top + ph - y
+            if h > 0:  # 위쪽만 4px 둥글게, 바닥은 반듯하게
+                r = min(4, h)
+                o.append(f'<path d="M{x:.1f},{top + ph:.1f} V{y + r:.1f} Q{x:.1f},{y:.1f} {x + r:.1f},{y:.1f} '
+                         f'H{x + bw - r:.1f} Q{x + bw:.1f},{y:.1f} {x + bw:.1f},{y + r:.1f} V{top + ph:.1f} Z" fill="{color}"/>')
+            o.append(f'<text x="{x + bw / 2:.1f}" y="{y - 6:.1f}" font-size="12" fill="{INK}" '
+                     f'text-anchor="middle">{v:g}%</text>')
+    o.append(f'<line x1="{left}" y1="{top + ph}" x2="{left + pw}" y2="{top + ph}" stroke="#c3c2b7" stroke-width="1"/>')
+    o.append("</svg>")
+    open(dst, "w").write("\n".join(o))
+
+
 def main():
     src, dst = sys.argv[1], sys.argv[2]
     rows = list(csv.DictReader(open(src)))
+    if "phase" in rows[0]:
+        return plot_failover(rows, dst)
     kind = "workers" if len({r["workers"] for r in rows}) > 1 else "idle"
     xkey = "workers" if kind == "workers" else "idle"
 
