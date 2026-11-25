@@ -28,6 +28,8 @@
 #define UPSTREAM_MAX_RESPONSE (16 * 1024 * 1024) /* CGI 출력 최대 크기 */
 #define PROXY_HEADER_LIMIT (16 * 1024)
 #define PROXY_BUFFER_SIZE  (64 * 1024)
+#define PROXY_CHUNK_OVERHEAD 32 /* 16진수 길이, CRLF, 마지막 0 청크 */
+#define PROXY_MAX_INFORMATIONAL 16
 #define MAX_REQUESTS_PER_CONN 100
 
 #define FILE_CHUNK   (64 * 1024)  /* 파일을 이만큼씩 읽어 보낸다 */
@@ -93,6 +95,9 @@ struct conn {
     int up_in_fd, up_out_fd;
     enum proxy_step px_step; /* 프록시: 지금 몇 번째 단계인지 (CGI 는 PX_NONE) */
     long proxy_remaining;   /* 남은 백엔드 본문 바이트. -1이면 EOF까지 받는다 */
+    int proxy_chunked_in, proxy_chunked_out;
+    unsigned proxy_informational;
+    struct proxy_chunks proxy_chunks;
     const char *up_send;    /* 업스트림에 보낼 것 (CGI: 요청 본문, 프록시: 다시 쓴 요청) */
     size_t up_send_len, up_send_sent;
     char *up_req;           /* 프록시: 다시 쓴 요청 (up_send 가 가리킴, 우리가 해제) */
@@ -154,6 +159,10 @@ static void release_upstream(struct conn *c)
     c->up_send_len = c->up_send_sent = c->up_len = c->up_cap = 0;
     c->px_step = PX_NONE;
     c->up_kind = UP_NONE;
+    c->proxy_remaining = 0;
+    c->proxy_chunked_in = c->proxy_chunked_out = 0;
+    c->proxy_informational = 0;
+    c->proxy_chunks = (struct proxy_chunks){ 0 };
 }
 
 static void release_response(struct conn *c)
@@ -771,8 +780,8 @@ static void proxy_flush(struct conn *c, long long now)
         sent = &c->chunk_sent;
     }
     ssize_t n = send(c->fd, buf + *sent, len - *sent, 0);
-    if (n < 0) {
-        if (!would_block())
+    if (n <= 0) {
+        if (n == 0 || !would_block())
             close_now(c);
         return;
     }
@@ -787,9 +796,32 @@ static void proxy_flush(struct conn *c, long long now)
     }
 }
 
-static void proxy_queue_body(struct conn *c, size_t len)
+static int proxy_queue_body(struct conn *c, size_t len, long long now)
 {
-    if (c->proxy_remaining >= 0) {
+    if (c->proxy_chunked_in) {
+        int done = proxy_decode_chunks(&c->proxy_chunks, c->chunk, len, &len);
+        if (done < 0) {
+            upstream_fail(c, 502, "malformed chunked response", now);
+            return -1;
+        }
+        if (c->proxy_chunked_out) {
+            if (len > 0) {
+                char prefix[PROXY_CHUNK_OVERHEAD];
+                size_t prefix_len = (size_t)snprintf(prefix, sizeof(prefix), "%zx\r\n", len);
+                memmove(c->chunk + prefix_len, c->chunk, len);
+                memcpy(c->chunk, prefix, prefix_len);
+                len += prefix_len;
+                memcpy(c->chunk + len, "\r\n", 2);
+                len += 2;
+            }
+            if (done) {
+                memcpy(c->chunk + len, "0\r\n\r\n", 5);
+                len += 5;
+            }
+        }
+        if (done)
+            proxy_finish_input(c);
+    } else if (c->proxy_remaining >= 0) {
         if (len > (size_t)c->proxy_remaining)
             len = (size_t)c->proxy_remaining;
         c->proxy_remaining -= (long)len;
@@ -798,11 +830,12 @@ static void proxy_queue_body(struct conn *c, size_t len)
     }
     c->chunk_len = len;
     c->chunk_sent = 0;
+    return 0;
 }
 
 static void proxy_read_head(struct conn *c, long long now)
 {
-    if (!c->chunk && !(c->chunk = malloc(PROXY_BUFFER_SIZE))) {
+    if (!c->chunk && !(c->chunk = malloc(PROXY_BUFFER_SIZE + PROXY_CHUNK_OVERHEAD))) {
         upstream_fail(c, 500, "out of memory", now);
         return;
     }
@@ -816,25 +849,40 @@ static void proxy_read_head(struct conn *c, long long now)
     c->up_len += (size_t)n;
     c->deadline = now + c->cfg->proxy_timeout_ms;
     size_t start = previous > 3 ? previous - 3 : 0;
-    long end = http_find_head_end(c->chunk + start, c->up_len - start);
-    if (end < 0) {
-        if (c->up_len == PROXY_HEADER_LIMIT)
-            upstream_fail(c, 502, "response header too large", now);
-        return;
-    }
-
-    size_t head_len = start + (size_t)end;
     struct upstream_response r;
-    if (upstream_parse_response(c->chunk, head_len, UPSTREAM_HTTP, &r) < 0) {
-        upstream_fail(c, 502, "malformed response header", now);
-        return;
+    size_t head_len;
+    for (;;) {
+        long end = http_find_head_end(c->chunk + start, c->up_len - start);
+        if (end < 0) {
+            if (c->up_len == PROXY_HEADER_LIMIT)
+                upstream_fail(c, 502, "response header too large", now);
+            return;
+        }
+
+        head_len = start + (size_t)end;
+        if (upstream_parse_response(c->chunk, head_len, UPSTREAM_HTTP, &r) < 0) {
+            upstream_fail(c, 502, "malformed response header", now);
+            return;
+        }
+        if (r.status >= 200)
+            break;
+        if (r.status == 101 || ++c->proxy_informational > PROXY_MAX_INFORMATIONAL) {
+            upstream_fail(c, 502, "unexpected informational response", now);
+            return;
+        }
+        /* 백엔드의 중간 응답 뒤에 최종 헤더가 같은 read에 올 수 있다. */
+        c->up_len -= head_len;
+        memmove(c->chunk, c->chunk + head_len, c->up_len);
+        start = 0;
     }
     int no_body = c->head_only || r.status == 204 || r.status == 304;
     c->proxy_remaining = no_body ? 0 : r.content_length;
-    if (c->proxy_remaining < 0)
+    c->proxy_chunked_in = !no_body && r.chunked;
+    c->proxy_chunked_out = c->proxy_chunked_in && strcmp(c->req.version, "HTTP/1.1") == 0;
+    if (c->proxy_remaining < 0 && !c->proxy_chunked_out)
         c->keep_alive = 0; /* 길이 없는 본문은 클라이언트에게도 EOF로 끝을 알린다. */
-    c->out = upstream_build_proxy_head(&r, c->req.version, c->keep_alive && !c->stopping,
-                                      &c->out_len);
+    c->out = upstream_build_proxy_head(&r, c->req.version, c->proxy_chunked_out,
+                                      c->keep_alive && !c->stopping, &c->out_len);
     if (!c->out) {
         upstream_fail(c, 500, "cannot build response header", now);
         return;
@@ -844,8 +892,8 @@ static void proxy_read_head(struct conn *c, long long now)
     c->px_step = PX_RELAYING;
     size_t received = c->up_len - head_len;
     memmove(c->chunk, c->chunk + head_len, received);
-    proxy_queue_body(c, received);
-    c->deadline = now + SEND_TIMEOUT_MS;
+    if (proxy_queue_body(c, received, now) == 0)
+        c->deadline = now + SEND_TIMEOUT_MS;
 }
 
 static void proxy_read_body(struct conn *c, long long now)
@@ -858,13 +906,17 @@ static void proxy_read_body(struct conn *c, long long now)
         if (!would_block())
             upstream_fail(c, 502, strerror(errno), now);
     } else if (n == 0) {
-        if (c->proxy_remaining >= 0)
+        if (c->proxy_remaining >= 0 || c->proxy_chunked_in)
             upstream_fail(c, 502, "response truncated", now);
         else
             finish_response(c, now);
-    } else {
-        proxy_queue_body(c, (size_t)n);
-        c->deadline = now + SEND_TIMEOUT_MS;
+    } else if (proxy_queue_body(c, (size_t)n, now) == 0) {
+        if (proxy_has_output(c))
+            c->deadline = now + SEND_TIMEOUT_MS;
+        else if (c->up_out_fd < 0)
+            finish_response(c, now);
+        else
+            c->deadline = now + c->cfg->proxy_timeout_ms;
     }
 }
 

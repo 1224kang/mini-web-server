@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,7 +118,17 @@ static int listed_in_connection(const char *conn_value, size_t conn_len, const c
 
 static int is_token_char(int ch)
 {
-    return isalnum(ch) || strchr("!#$%&'*+-.^_`|~", ch) != NULL;
+    return isalnum(ch) || (ch != '\0' && strchr("!#$%&'*+-.^_`|~", ch) != NULL);
+}
+
+static int valid_field_value(const char *s, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        if ((ch < ' ' && ch != '\t') || ch == 127)
+            return 0;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -128,7 +139,8 @@ static int is_token_char(int ch)
 static int parse_status(const char *p, size_t len, int *status, char *reason, size_t cap)
 {
     if (len < 3 || !isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]) ||
-        !isdigit((unsigned char)p[2]) || (len > 3 && p[3] != ' '))
+        !isdigit((unsigned char)p[2]) || (len > 3 && p[3] != ' ') ||
+        !valid_field_value(p, len))
         return -1;
     *status = (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
     size_t rlen = len > 4 ? len - 4 : 0;
@@ -152,13 +164,14 @@ int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind
         if (!nl)
             return -1;
         size_t llen = (size_t)(nl - buf);
-        if (llen > 0 && buf[llen - 1] == '\r')
-            llen--;
-        if (llen < 12 || memcmp(buf, "HTTP/1.", 7) != 0 || !isdigit((unsigned char)buf[7]) ||
+        if (llen == 0 || buf[--llen] != '\r')
+            return -1;
+        if (llen < 12 || memcmp(buf, "HTTP/1.", 7) != 0 || (buf[7] != '0' && buf[7] != '1') ||
             buf[8] != ' ' ||
             parse_status(buf + 9, llen - 9, &out->status, out->reason, sizeof(out->reason)) < 0)
             return -1;
         pos = (size_t)(nl - buf) + 1;
+        out->version_minor = buf[7];
     }
 
     int has_status = kind == UPSTREAM_HTTP, has_location = 0;
@@ -171,6 +184,8 @@ int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind
         size_t llen = (size_t)(nl - line);
         if (llen > 0 && line[llen - 1] == '\r')
             llen--;
+        else if (kind == UPSTREAM_HTTP)
+            return -1;
         if (llen == 0) { /* 빈 줄 = 헤더 끝 */
             out->head_len = (size_t)(line - out->head);
             pos = (size_t)(nl - buf) + 1;
@@ -183,19 +198,19 @@ int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind
         for (size_t i = 0; i < nlen; i++)
             if (!is_token_char((unsigned char)line[i]))
                 return -1;
-        if (memchr(line, '\r', llen))
-            return -1; /* 줄 가운데 \r: 헤더를 몰래 끼워 넣으려는 시도로 보고 거절 */
+        if (!valid_field_value(colon + 1, llen - nlen - 1))
+            return -1;
         const char *v = colon + 1;
         size_t vlen = llen - nlen - 1;
         while (vlen > 0 && (*v == ' ' || *v == '\t')) {
             v++;
             vlen--;
         }
+        while (vlen > 0 && (v[vlen - 1] == ' ' || v[vlen - 1] == '\t'))
+            vlen--;
 
         if (name_is(line, nlen, "Content-Length")) {
             long cl = 0;
-            while (vlen > 0 && (v[vlen - 1] == ' ' || v[vlen - 1] == '\t'))
-                vlen--;
             if (vlen == 0)
                 return -1;
             for (size_t i = 0; i < vlen; i++) {
@@ -213,14 +228,18 @@ int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind
         } else if (kind == UPSTREAM_CGI && name_is(line, nlen, "Location")) {
             has_location = 1;
         } else if (kind == UPSTREAM_HTTP && name_is(line, nlen, "Transfer-Encoding")) {
-            return -1; /* HTTP/1.0 으로 물었으니 chunked 가 오면 안 된다 */
+            if (out->version_minor != '1' || out->chunked || !name_is(v, vlen, "chunked"))
+                return -1;
+            out->chunked = 1;
         }
         pos = (size_t)(nl - buf) + 1;
     }
 
     if (!has_status) /* CGI 규칙: Status 가 없으면 200, Location 만 있으면 302 */
         out->status = has_location ? 302 : 200;
-    if (out->status < 200 || out->status > 599)
+    if (out->status < (kind == UPSTREAM_HTTP ? 100 : 200) || out->status > 599)
+        return -1;
+    if (out->chunked && (out->content_length >= 0 || out->status < 200 || out->status == 204))
         return -1;
     if (out->reason[0] == '\0')
         snprintf(out->reason, sizeof(out->reason), "%s", http_reason(out->status));
@@ -234,7 +253,7 @@ int upstream_parse_response(const char *buf, size_t len, enum upstream_kind kind
 }
 
 static char *build_client_response(const struct upstream_response *r, const char *version,
-                                   long content_length, int include_body, int keep_alive,
+                                   long content_length, int chunked, int include_body, int keep_alive,
                                    const char *via, size_t *out_len)
 {
     /* 업스트림 응답의 Connection 헤더 값 (거기 적힌 헤더도 빼야 한다) */
@@ -272,7 +291,9 @@ static char *build_client_response(const struct upstream_response *r, const char
         line = nl ? nl + 1 : end;
     }
 
-    if (r->status != 204 && content_length >= 0)
+    if (chunked)
+        sb_printf(&s, "Transfer-Encoding: chunked\r\n");
+    else if (r->status != 204 && content_length >= 0)
         sb_printf(&s, "Content-Length: %ld\r\n", content_length);
     sb_printf(&s, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
     if (via)
@@ -288,15 +309,98 @@ char *upstream_build_client_response(const struct upstream_response *r, int head
 {
     int no_body = r->status == 204 || r->status == 304;
     long length = head_only && r->content_length >= 0 ? r->content_length : (long)r->body_len;
-    return build_client_response(r, "HTTP/1.1", no_body ? -1 : length,
+    return build_client_response(r, "HTTP/1.1", no_body ? -1 : length, 0,
                                  !head_only && !no_body, keep_alive, via, out_len);
 }
 
 char *upstream_build_proxy_head(const struct upstream_response *r, const char *version,
-                                int keep_alive, size_t *out_len)
+                                int send_chunked, int keep_alive, size_t *out_len)
 {
-    return build_client_response(r, version, r->content_length, 0, keep_alive,
-                                 "1.1 mini-web-server", out_len);
+    const char *via = r->version_minor == '1' ? "1.1 mini-web-server" : "1.0 mini-web-server";
+    return build_client_response(r, version, r->content_length, send_chunked, 0, keep_alive,
+                                 via, out_len);
+}
+
+static int chunk_size_from_line(const char *line, size_t len, size_t *size)
+{
+    size_t i = 0;
+    *size = 0;
+    while (i < len && isxdigit((unsigned char)line[i])) {
+        int ch = tolower((unsigned char)line[i++]);
+        unsigned digit = (unsigned)(ch <= '9' ? ch - '0' : ch - 'a' + 10);
+        if (*size > (SIZE_MAX - digit) / 16)
+            return -1;
+        *size = *size * 16 + digit;
+    }
+    if (i == 0)
+        return -1;
+    if (i == len)
+        return 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t'))
+        i++;
+    /* 확장은 중계하지 않는다. 길이와 줄의 경계만 사용한다. */
+    return i < len && line[i] == ';' && valid_field_value(line + i, len - i) ? 0 : -1;
+}
+
+static int valid_trailer(const char *line, size_t len)
+{
+    const char *colon = memchr(line, ':', len);
+    if (!colon || colon == line)
+        return 0;
+    for (const char *p = line; p < colon; p++)
+        if (!is_token_char((unsigned char)*p))
+            return 0;
+    return valid_field_value(colon + 1, len - (size_t)(colon + 1 - line));
+}
+
+int proxy_decode_chunks(struct proxy_chunks *c, char *buf, size_t len, size_t *decoded)
+{
+    *decoded = 0;
+    for (size_t i = 0; i < len;) {
+        if (c->step == CHUNK_DATA) {
+            size_t n = len - i < c->left ? len - i : c->left;
+            memmove(buf + *decoded, buf + i, n);
+            *decoded += n;
+            i += n;
+            c->left -= n;
+            if (c->left == 0)
+                c->step = CHUNK_DATA_CR;
+            continue;
+        }
+
+        char ch = buf[i++];
+        if (c->step == CHUNK_DATA_CR || c->step == CHUNK_DATA_LF) {
+            int expect_cr = c->step == CHUNK_DATA_CR;
+            if (ch != (expect_cr ? '\r' : '\n'))
+                return -1;
+            c->step = expect_cr ? CHUNK_DATA_LF : CHUNK_SIZE;
+            continue;
+        }
+
+        if (c->step == CHUNK_TRAILERS && ++c->trailer_bytes > 16 * 1024)
+            return -1;
+        if (ch != '\n') {
+            if (c->line_len == sizeof(c->line))
+                return -1;
+            c->line[c->line_len++] = ch;
+            continue;
+        }
+        if (c->line_len == 0 || c->line[c->line_len - 1] != '\r')
+            return -1;
+        size_t line_len = c->line_len - 1;
+        c->line_len = 0;
+        if (c->step == CHUNK_SIZE) {
+            if (chunk_size_from_line(c->line, line_len, &c->left) < 0)
+                return -1;
+            c->step = c->left ? CHUNK_DATA : CHUNK_TRAILERS;
+        } else {
+            if (line_len == 0)
+                return 1;
+            if (!valid_trailer(c->line, line_len))
+                return -1;
+        }
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -311,7 +415,7 @@ char *proxy_build_request(const struct http_request *req, const char *body, size
     const char *orig_host = http_get_header(req, "Host");
 
     struct sb s = { 0 };
-    sb_printf(&s, "%s %s HTTP/1.0\r\n", req->method, req->target);
+    sb_printf(&s, "%s %s HTTP/1.1\r\n", req->method, req->target);
     sb_printf(&s, "Host: %s\r\n", backend_host);
 
     struct sb xff = { 0 }; /* 앞 프록시들이 남긴 X-Forwarded-For 를 모두 이어 붙인다 */

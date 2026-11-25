@@ -33,6 +33,8 @@ struct upstream_response {
     const char *body;
     size_t body_len;
     long content_length;  /* 업스트림이 보낸 Content-Length (없으면 -1). HEAD 응답에 쓴다 */
+    int chunked;
+    char version_minor;
 };
 
 /* 업스트림이 보낸 전체 출력 buf[0..len) 을 해석한다. 형식이 틀렸으면 -1 (→ 502). */
@@ -48,12 +50,24 @@ char *upstream_build_client_response(const struct upstream_response *r, int head
 
 /* 프록시 중계용 헤더. 본문은 호출자가 조각 단위로 전송한다. */
 char *upstream_build_proxy_head(const struct upstream_response *r, const char *version,
-                                int keep_alive, size_t *out_len);
+                                int send_chunked, int keep_alive, size_t *out_len);
+
+enum chunk_step { CHUNK_SIZE, CHUNK_DATA, CHUNK_DATA_CR, CHUNK_DATA_LF, CHUNK_TRAILERS };
+
+struct proxy_chunks {
+    enum chunk_step step;
+    size_t left;
+    size_t line_len;
+    size_t trailer_bytes;
+    char line[1024];
+};
+
+/* 조각 경계를 검증하고 buf 앞에 본문을 모은다. 0은 계속, 1은 완료, -1은 형식 오류. */
+int proxy_decode_chunks(struct proxy_chunks *chunks, char *buf, size_t len, size_t *decoded);
 
 /* 프록시: 클라이언트 요청을 백엔드에게 보낼 요청으로 다시 쓴다 (malloc, 실패하면 NULL).
  *
- *   - 백엔드와는 HTTP/1.0 + "Connection: close": 응답 끝 = 연결 끝이라 읽기가 단순해지고,
- *     HTTP/1.0 상대에게는 chunked 인코딩을 쓸 수 없으므로 본문 형식도 단순해진다.
+ *   - 백엔드와는 HTTP/1.1 + "Connection: close": 요청마다 새 연결을 사용한다.
  *   - Host                → 백엔드 주소로 바꾸고, 원래 Host 는 X-Forwarded-Host 로 보낸다.
  *   - X-Forwarded-For     → 기존 값 뒤에 ", <클라이언트 IP>" 를 덧붙인다(프록시를 여러 번 거쳐도 경로가 남게).
  *   - X-Forwarded-Proto   → "http"

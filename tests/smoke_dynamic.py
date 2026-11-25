@@ -7,6 +7,7 @@
 번갈아 나오는지, 느린 백엔드/CGI 가 504 가 되는지, 좀비가 남지 않는지까지 확인한다.
 """
 import concurrent.futures
+import http.client
 import json
 import os
 import shutil
@@ -19,7 +20,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-BIN = os.path.join(REPO, "webserver")
+BIN = os.environ.get("WEBSERVER", os.path.join(REPO, "webserver"))
 PORT = int(os.environ.get("PORT", "18299"))
 BACKEND_PORTS = [18301, 18302, 18303]
 TMP = tempfile.mkdtemp(prefix="mws-dyn-")
@@ -230,6 +231,70 @@ def test_proxy_stream():
           st == 200 and h.get("content-length") == "10" and b == b"abc")
 
 
+def test_proxy_framing():
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=4)
+    try:
+        c.request("GET", "/api/chunked")
+        sock = c.sock
+        r = c.getresponse()
+        check("HTTP/1.1 chunked 본문 중계와 헤더 재작성",
+              r.status == 200 and r.chunked and r.getheader("Trailer") is None
+              and r.read() == b"hello world")
+        c.request("GET", "/api/informational")
+        r = c.getresponse()
+        check("chunked 이후 같은 연결에서 최종 응답만 전송",
+              c.sock is sock and r.status == 200 and r.read() == b"ok")
+        c.request("GET", "/api/eof")
+        r = c.getresponse()
+        check("길이 없는 응답은 종료까지 중계",
+              r.status == 200 and r.will_close and r.read() == b"until close")
+    finally:
+        c.close()
+
+    with socket.create_connection(("127.0.0.1", PORT), timeout=4) as s:
+        s.sendall(b"GET /api/chunked HTTP/1.0\r\nHost: t\r\n\r\n")
+        with s.makefile("rb") as stream:
+            head, _, body = stream.read().partition(b"\r\n\r\n")
+        check("HTTP/1.0 클라이언트에게 chunked 디코딩 후 연결 종료",
+              head.startswith(b"HTTP/1.0 200") and b"Transfer-Encoding:" not in head
+              and body == b"hello world")
+    with socket.create_connection(("127.0.0.1", PORT), timeout=4) as s:
+        s.sendall(b"GET /api/chunk-cut HTTP/1.1\r\nHost: t\r\n\r\n"
+                  b"GET /index.html HTTP/1.1\r\nHost: t\r\n\r\n")
+        with s.makefile("rb") as stream:
+            head, _, body = stream.read().partition(b"\r\n\r\n")
+        check("잘린 chunked 응답에 종료 청크나 다음 응답을 보내지 않음",
+              head.startswith(b"HTTP/1.1 200") and body == b"3\r\nabc\r\n")
+
+
+def test_configured_timeouts():
+    with socket.create_connection(("127.0.0.1", PORT), timeout=2) as s:
+        s.sendall(b"GET /index.html HTTP/1.1\r\nHost: t\r\n\r\n")
+        st, _, _, _ = read_one(s, b"")
+        start = time.monotonic()
+        check("설정한 600 ms 뒤 유휴 keep-alive 닫힘",
+              st == 200 and s.recv(1) == b"" and 0.35 < time.monotonic() - start < 1.5)
+
+    with socket.create_connection(("127.0.0.1", PORT), timeout=2) as s:
+        s.sendall(b"GET /")
+        start = time.monotonic()
+        for _ in range(3):
+            time.sleep(0.1)
+            s.sendall(b"x")
+        with s.makefile("rb") as stream:
+            status = stream.readline()
+        check("헤더 일부를 반복해서 보내도 350 ms 전체 마감 적용",
+              b" 408 " in status and time.monotonic() - start < 0.6)
+
+    with socket.create_connection(("127.0.0.1", PORT), timeout=2) as s:
+        s.sendall(b"POST /builtin/echo HTTP/1.1\r\nHost: t\r\nContent-Length: 6\r\n\r\nabc")
+        start = time.monotonic()
+        with s.makefile("rb") as stream:
+            status = stream.readline()
+        check("설정한 본문 수신 마감에 408",
+              b" 408 " in status and 0.2 < time.monotonic() - start < 1.5)
+
+
 def test_proxy(backends):
     seq = []
     for _ in range(6):
@@ -238,6 +303,7 @@ def test_proxy(backends):
     names = [f"b{p}" for p in BACKEND_PORTS]
     check("Round-Robin: 3개에 번갈아 분배", seq == names * 2, seq)
     test_proxy_stream()
+    test_proxy_framing()
 
     st, h, b, _ = request("GET", "/api/hdr?x=1", headers={"X-Forwarded-For": "1.2.3.4", "X-Hop": "1",
                                                            "Connection": "close, X-Hop"})
@@ -249,8 +315,8 @@ def test_proxy(backends):
     check("X-Forwarded-For 에 클라이언트 IP 덧붙임", bh.get("x-forwarded-for") == "1.2.3.4, 127.0.0.1",
           bh.get("x-forwarded-for"))
     check("X-Forwarded-Proto: http", bh.get("x-forwarded-proto") == "http")
-    check("백엔드와는 HTTP/1.0 + Connection: close",
-          j["request_version"] == "HTTP/1.0" and bh.get("connection") == "close", bh)
+    check("백엔드와는 HTTP/1.1 + Connection: close",
+          j["request_version"] == "HTTP/1.1" and bh.get("connection") == "close", bh)
     check("hop-by-hop(Connection 에 적힌 X-Hop) 제거", "x-hop" not in bh, bh)
     check("응답: 백엔드 헤더(X-Backend) 유지 + Via 추가",
           h.get("x-backend", "").startswith("b") and h.get("via") == "1.1 mini-web-server", h)
@@ -297,6 +363,9 @@ def main():
     with open(conf, "w") as f:
         f.write(f"cgi_dir {os.path.join(REPO, 'cgi-bin')}\n"
                 "cgi_timeout_ms 2000\n"
+                "keepalive_timeout_ms 600\n"
+                "header_timeout_ms 350\n"
+                "body_timeout_ms 350\n"
                 "proxy_connect_timeout_ms 500\n"
                 "proxy_timeout_ms 1000\n"
                 "proxy /api/ " + " ".join(f"127.0.0.1:{p}" for p in BACKEND_PORTS) + "\n")
@@ -311,6 +380,7 @@ def main():
         test_cgi_concurrency()
         test_keepalive_mix()
         test_builtin()
+        test_configured_timeouts()
         test_proxy(backends)
 
         time.sleep(0.3)

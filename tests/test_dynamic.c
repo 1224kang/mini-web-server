@@ -81,12 +81,41 @@ static void test_parse_http(void)
     CHECK(r.content_length == 10 && r.body_len == 3);
 
     out = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
-    CHECK(upstream_parse_response(out, strlen(out), UPSTREAM_HTTP, &r) < 0);
+    CHECK(upstream_parse_response(out, strlen(out), UPSTREAM_HTTP, &r) == 0 && r.chunked);
     out = "garbage\r\n\r\n";
     CHECK(upstream_parse_response(out, strlen(out), UPSTREAM_HTTP, &r) < 0);
     out = "HTTP/1.0 999 What\r\n\r\n";
     CHECK(upstream_parse_response(out, strlen(out), UPSTREAM_HTTP, &r) < 0);
     printf("PASS parse http response\n");
+}
+
+static void test_decode_chunks(void)
+{
+    struct proxy_chunks chunks = { 0 };
+    char body[9] = { 0 };
+    size_t used = 0;
+    const char *encoded = "3;name=value\r\nabc\r\n5\r\ndefgh\r\n0\r\nX-Test: yes\r\n\r\n";
+    int done = 0;
+    for (size_t i = 0; encoded[i] && done == 0; i++) {
+        char ch = encoded[i];
+        size_t decoded;
+        done = proxy_decode_chunks(&chunks, &ch, 1, &decoded);
+        if (decoded && used < sizeof(body) - 1)
+            body[used++] = ch;
+    }
+    CHECK(done == 1);
+    CHECK(strcmp(body, "abcdefgh") == 0);
+
+    chunks = (struct proxy_chunks){ 0 };
+    char joined[] = "2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n";
+    size_t decoded;
+    CHECK(proxy_decode_chunks(&chunks, joined, sizeof(joined) - 1, &decoded) == 1);
+    CHECK(decoded == 4 && memcmp(joined, "abcd", 4) == 0);
+
+    chunks = (struct proxy_chunks){ 0 };
+    char invalid[] = "oops\r\n";
+    CHECK(proxy_decode_chunks(&chunks, invalid, sizeof(invalid) - 1, &decoded) < 0);
+    printf("PASS decode incrementally framed chunks\n");
 }
 
 static void test_build_client_response(void)
@@ -141,7 +170,7 @@ static void test_proxy_request(void)
         return;
     size_t len;
     char *out = proxy_build_request(&req, "abc", 3, "10.0.0.7", "127.0.0.1:8001", &len);
-    CHECK(out && strncmp(out, "POST /api/x?y=1 HTTP/1.0\r\n", 26) == 0);
+    CHECK(out && strncmp(out, "POST /api/x?y=1 HTTP/1.1\r\n", 26) == 0);
     CONTAINS(out, "Host: 127.0.0.1:8001\r\n");
     CONTAINS(out, "X-Forwarded-Host: example.com:18080\r\n");
     CONTAINS(out, "X-Forwarded-For: 1.1.1.1, 10.0.0.7\r\n");
@@ -267,6 +296,7 @@ int main(void)
 {
     test_parse_cgi();
     test_parse_http();
+    test_decode_chunks();
     test_build_client_response();
     test_proxy_request();
     test_cgi_env();

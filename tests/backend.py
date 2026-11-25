@@ -21,9 +21,36 @@ NAME = sys.argv[2] if len(sys.argv) > 2 else f"backend-{PORT}"
 
 class Handler(BaseHTTPRequestHandler):
     server_version = f"{NAME}/1.0"
+    protocol_version = "HTTP/1.1"
 
     def _reply(self):
         url = urlsplit(self.path)
+        if url.path == "/api/chunked":
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Trailer", "X-Test")
+            self.end_headers()
+            for part in (b"5\r", b"\nhello\r\n", b"6\r\n world\r\n", b"0\r\nX-Test: yes\r\n\r\n"):
+                self.wfile.write(part)
+                time.sleep(0.02)
+            return
+        if url.path == "/api/eof":
+            self.send_response(200)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"until close")
+            self.close_connection = True
+            return
+        if url.path == "/api/chunk-cut":
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"3\r\nabc\r\n")
+            return
+        if url.path == "/api/informational":
+            self.wfile.write(b"HTTP/1.1 103 Early Hints\r\n\r\n"
+                             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            return
         if url.path == "/api/stream":
             size = 20 * 1024 * 1024
             self.send_response(200)
