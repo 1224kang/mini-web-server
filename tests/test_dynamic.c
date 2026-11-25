@@ -115,6 +115,21 @@ static void test_decode_chunks(void)
     chunks = (struct proxy_chunks){ 0 };
     char invalid[] = "oops\r\n";
     CHECK(proxy_decode_chunks(&chunks, invalid, sizeof(invalid) - 1, &decoded) < 0);
+
+    /* 요청 본문용: 마지막 빈 줄 뒤(다음 요청)는 소비하지 않는다 */
+    chunks = (struct proxy_chunks){ 0 };
+    char pipelined[] = "3\r\nabc\r\n0\r\n\r\nGET / HTTP/1.1\r\n";
+    size_t used_bytes;
+    CHECK(http_decode_chunks(&chunks, pipelined, sizeof(pipelined) - 1, &decoded, &used_bytes) == 1);
+    CHECK(decoded == 3 && memcmp(pipelined, "abc", 3) == 0);
+    CHECK(used_bytes == strlen("3\r\nabc\r\n0\r\n\r\n"));
+    CHECK(memcmp(pipelined + used_bytes, "GET / ", 6) == 0);
+
+    /* 아직 안 끝났으면 받은 바이트 전부 소비 */
+    chunks = (struct proxy_chunks){ 0 };
+    char partial[] = "5\r\nhel";
+    CHECK(http_decode_chunks(&chunks, partial, sizeof(partial) - 1, &decoded, &used_bytes) == 0);
+    CHECK(decoded == 3 && used_bytes == sizeof(partial) - 1);
     printf("PASS decode incrementally framed chunks\n");
 }
 

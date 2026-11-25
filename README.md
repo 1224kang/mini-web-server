@@ -53,6 +53,19 @@ flowchart LR
 
 응답 헤더 전송 전의 백엔드 오류는 502, 제한 시간 초과는 504를 반환합니다. 응답 전송이 시작된 뒤 백엔드가 본문을 끝내지 못하면 해당 클라이언트 연결을 닫습니다. HTTP 응답 경계는 [RFC 9112 §6.3 및 §7.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3)을 참고했습니다.
 
+### 요청 본문의 경계
+
+요청 본문도 같은 규칙으로 끝을 정합니다(`http_body_framing`). 본문 끝을 잘못 판단하면 뒤에 숨긴 요청이 별도 요청으로 처리되는 request smuggling이 생기므로, 모호한 경우는 거절하고 연결을 닫습니다.
+
+| 요청 헤더 | 처리 |
+|---|---|
+| `Content-Length` | 선언된 바이트 수만큼 읽습니다. |
+| `Transfer-Encoding: chunked` | 응답 중계에 쓰는 chunked 디코더로 마지막 0 청크까지 읽어 본문을 모읍니다. 디코딩한 본문은 CGI에는 `CONTENT_LENGTH`, 백엔드에는 `Content-Length`로 전달합니다. 본문 뒤에 이어 온 요청은 keep-alive로 계속 처리합니다. |
+| `Transfer-Encoding`과 `Content-Length`가 함께 있음 | 400 |
+| HTTP/1.0 요청의 `Transfer-Encoding`, `chunked`가 마지막이 아니거나 두 번 이상 | 400 |
+| `gzip, chunked`처럼 지원하지 않는 코딩 | 501 |
+| 잘못된 청크 형식, 1 MiB 초과 | 400, 413 |
+
 ## 실행
 
 ```sh
@@ -87,4 +100,4 @@ make asan test-asan
 WEBSERVER=./webserver_asan make smoke-dynamic
 ```
 
-동적 스모크는 20 MiB 응답 중계, 백엔드 전송 완료 전 첫 본문 수신, 느린 클라이언트가 있는 동안의 정적 응답, 고정 길이·`chunked`·EOF 경계, 잘린 응답, 설정으로 바뀐 타임아웃을 확인합니다. 기존 CGI·정적 파일·keep-alive·라운드 로빈 테스트도 함께 실행합니다.
+동적 스모크는 20 MiB 응답 중계, 백엔드 전송 완료 전 첫 본문 수신, 느린 클라이언트가 있는 동안의 정적 응답, 고정 길이·`chunked`·EOF 경계, 잘린 응답, 설정으로 바뀐 타임아웃을 확인합니다. 요청 쪽은 chunked 본문(잘게 나눈 전송, 파이프라이닝, CGI·프록시 전달)과 TE·CL 충돌, 지원하지 않는 코딩, 형식 오류, 한도 초과를 확인합니다. 기존 CGI·정적 파일·keep-alive·라운드 로빈 테스트도 함께 실행합니다.

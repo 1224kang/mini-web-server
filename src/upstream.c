@@ -355,7 +355,15 @@ static int valid_trailer(const char *line, size_t len)
 
 int proxy_decode_chunks(struct proxy_chunks *c, char *buf, size_t len, size_t *decoded)
 {
+    size_t used;
+    return http_decode_chunks(c, buf, len, decoded, &used);
+}
+
+int http_decode_chunks(struct proxy_chunks *c, char *buf, size_t len, size_t *decoded,
+                       size_t *used)
+{
     *decoded = 0;
+    *used = len;
     for (size_t i = 0; i < len;) {
         if (c->step == CHUNK_DATA) {
             size_t n = len - i < c->left ? len - i : c->left;
@@ -394,8 +402,10 @@ int proxy_decode_chunks(struct proxy_chunks *c, char *buf, size_t len, size_t *d
                 return -1;
             c->step = c->left ? CHUNK_DATA : CHUNK_TRAILERS;
         } else {
-            if (line_len == 0)
+            if (line_len == 0) {
+                *used = i; /* 마지막 빈 줄 바로 뒤. 그 뒤 바이트는 다음 메시지 */
                 return 1;
+            }
             if (!valid_trailer(c->line, line_len))
                 return -1;
         }

@@ -185,6 +185,69 @@ int http_content_length(const struct http_request *req, size_t *out)
     return 0;
 }
 
+/* Transfer-Encoding 값들을 쉼표 목록으로 훑어 코딩 개수와 마지막 코딩이 chunked 인지 센다. */
+struct te_scan {
+    size_t codings;      /* 빈 항목을 뺀 코딩 수 */
+    size_t chunked;      /* 그중 chunked 수 */
+    int last_is_chunked;
+};
+
+static void scan_transfer_codings(const char *list, struct te_scan *s)
+{
+    const char *p = list;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',')
+            p++;
+        const char *start = p;
+        while (*p && *p != ',')
+            p++;
+        const char *end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+            end--;
+        if (end == start)
+            continue;
+        int is_chunked = (size_t)(end - start) == 7 && strncasecmp(start, "chunked", 7) == 0;
+        s->codings++;
+        s->chunked += (size_t)is_chunked;
+        s->last_is_chunked = is_chunked;
+    }
+}
+
+int http_body_framing(const struct http_request *req, enum http_body_kind *kind, size_t *length)
+{
+    *kind = HTTP_BODY_NONE;
+    *length = 0;
+
+    struct te_scan te = { 0 };
+    int has_te = 0, has_cl = 0;
+    for (size_t i = 0; i < req->header_count; i++) {
+        if (strcasecmp(req->headers[i].name, "Transfer-Encoding") == 0) {
+            has_te = 1;
+            scan_transfer_codings(req->headers[i].value, &te);
+        } else if (strcasecmp(req->headers[i].name, "Content-Length") == 0) {
+            has_cl = 1;
+        }
+    }
+
+    if (has_te) {
+        /* 둘 다 있으면 앞단 프록시와 우리가 본문 끝을 다르게 볼 수 있다 → 거절 */
+        if (has_cl || strcmp(req->version, "HTTP/1.0") == 0)
+            return 400;
+        /* chunked 가 마지막이 아니면 본문 끝을 알 수 없다 (RFC 9112 §6.3) */
+        if (te.codings == 0 || !te.last_is_chunked || te.chunked > 1)
+            return 400;
+        if (te.codings > 1)
+            return 501; /* gzip 같은 다른 코딩은 풀 줄 모른다 */
+        *kind = HTTP_BODY_CHUNKED;
+        return 0;
+    }
+
+    if (http_content_length(req, length) < 0)
+        return 400;
+    *kind = *length > 0 ? HTTP_BODY_LENGTH : HTTP_BODY_NONE;
+    return 0;
+}
+
 /* "keep-alive, Upgrade" 처럼 쉼표로 나열된 토큰 중에 word 가 있는지 (대소문자 무시). */
 static int has_token(const char *list, const char *word)
 {
@@ -240,6 +303,7 @@ const char *http_reason(int status)
     case 414: return "URI Too Long";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
+    case 501: return "Not Implemented";
     case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
     case 504: return "Gateway Timeout";

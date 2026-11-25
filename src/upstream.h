@@ -65,6 +65,12 @@ struct proxy_chunks {
 /* 조각 경계를 검증하고 buf 앞에 본문을 모은다. 0은 계속, 1은 완료, -1은 형식 오류. */
 int proxy_decode_chunks(struct proxy_chunks *chunks, char *buf, size_t len, size_t *decoded);
 
+/* proxy_decode_chunks 와 같고, *used 에 buf 에서 소비한 바이트 수를 돌려준다.
+ * 완료(1)면 마지막 빈 줄 바로 뒤까지이고, 그 뒤 바이트는 다음 메시지(파이프라이닝)다.
+ * 계속(0)이면 len 전부를 소비한다. 요청 본문(Transfer-Encoding: chunked)을 읽을 때 쓴다. */
+int http_decode_chunks(struct proxy_chunks *chunks, char *buf, size_t len, size_t *decoded,
+                       size_t *used);
+
 /* 프록시: 클라이언트 요청을 백엔드에게 보낼 요청으로 다시 쓴다 (malloc, 실패하면 NULL).
  *
  *   - 백엔드와는 HTTP/1.1 + "Connection: close": 요청마다 새 연결을 사용한다.
