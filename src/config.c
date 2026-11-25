@@ -17,6 +17,7 @@ void config_defaults(struct server_config *cfg)
     cfg->cgi_timeout_ms = 5000;
     cfg->proxy_connect_timeout_ms = 1000;
     cfg->proxy_timeout_ms = 5000;
+    cfg->proxy_fail_timeout_ms = 10000;
 
     struct stat st;
     if (stat("cgi-bin", &st) == 0 && S_ISDIR(st.st_mode) && !realpath("cgi-bin", cfg->cgi_dir))
@@ -99,6 +100,8 @@ int config_load(struct server_config *cfg, const char *path)
             rc = parse_ms(val, &cfg->proxy_connect_timeout_ms);
         } else if (strcmp(key, "proxy_timeout_ms") == 0) {
             rc = parse_ms(val, &cfg->proxy_timeout_ms);
+        } else if (strcmp(key, "proxy_fail_timeout_ms") == 0) {
+            rc = parse_ms(val, &cfg->proxy_fail_timeout_ms);
         } else if (strcmp(key, "proxy") == 0) {
             if (cfg->nroutes == CONFIG_MAX_ROUTES || !val || val[0] != '/' ||
                 strlen(val) >= CONFIG_MAX_PREFIX) {
@@ -131,6 +134,44 @@ int config_load(struct server_config *cfg, const char *path)
     }
     fclose(f);
     return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* 백엔드 장애 조치 (passive health check)                                 */
+/* ------------------------------------------------------------------ */
+
+struct backend *config_pick_alive(struct proxy_route *route, long long now, unsigned *tried)
+{
+    struct backend *fallback = NULL;
+    /* Round-Robin 카운터를 한 칸씩 돌리며 최대 nbackends 번 본다.
+     * 모두 살아 있으면 한 번에 끝나므로 순서는 config_pick_backend 와 같다. */
+    for (int k = 0; k < route->nbackends; k++) {
+        struct backend *b = (struct backend *)config_pick_backend(route);
+        unsigned bit = 1u << (unsigned)(b - route->backends);
+        if (*tried & bit)
+            continue;
+        if (config_is_down(b, now)) {
+            if (!fallback)
+                fallback = b;
+            continue;
+        }
+        *tried |= bit;
+        return b;
+    }
+    /* 살아 있는 백엔드가 없다: down 이라도 아직 안 해 본 것으로 복구를 확인한다 */
+    if (fallback)
+        *tried |= 1u << (unsigned)(fallback - route->backends);
+    return fallback;
+}
+
+void config_mark_down(struct backend *b, long long until)
+{
+    atomic_store_explicit(&b->down_until, until, memory_order_relaxed);
+}
+
+int config_is_down(const struct backend *b, long long now)
+{
+    return now < atomic_load_explicit(&b->down_until, memory_order_relaxed);
 }
 
 struct proxy_route *config_match_route(struct server_config *cfg, const char *target)
