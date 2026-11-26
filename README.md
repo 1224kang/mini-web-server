@@ -19,11 +19,10 @@ C와 POSIX API로 만든 HTTP/1.1 웹 서버. 정적 파일, CGI, 내장 핸들�
 - [성능 (Performance)](#성능-performance)
 - [안정성 (Stability)](#안정성-stability)
 - [확장성 (Scalability)](#확장성-scalability)
-- [활용 예시: 트래픽 유형별](#활용-예시-트래픽-유형별)
-- [한계와 상용 웹 서버 비교](#한계와-상용-웹-서버-비교)
+- [실제 서비스에 적용한다면: 콘서트 티켓팅 날](#실제-서비스에-적용한다면-콘서트-티켓팅-날)
 - [설정](#설정)
-- [테스트](#테스트)
 - [측정 재현](#측정-재현)
+- [테스트](#테스트)
 - [팀 PR 통합 기록](#팀-pr-통합-기록)
 
 ## 빠른 시작
@@ -311,71 +310,52 @@ CPU 코어와 백엔드 서버를 늘리면 처리량도 늘어나는 것이 목
 - 루프 2개에서 약 1.6배. 4개 이상은 서버와 `ab` 4개가 같은 컴퓨터의 코어를 나눠 써서 부하 도구가 한계였을 가능성이 크다.
 - 노는 연결이 없으면 개선 전과 차이 3% 이내. 성능 개선이 평소 처리량을 해치지 않는다.
 
-## 활용 예시: 트래픽 유형별
+## 실제 서비스에 적용한다면: 콘서트 티켓팅 날
 
-서비스마다 트래픽 모양이 다르므로 이 서버를 쓰는 위치와 보완할 점도 다르다. 아래는 설계 예시이며 서비스 단위로 측정하지는 않았다.
-
-| | 수강신청 | 주식 거래 | 선거 개표 |
-|---|---|---|---|
-| 유형 | 순간 폭주형 | 연결 유지형 | 읽기 폭주형 |
-| 트래픽 모양 | 오픈 순간에 몰리고 금방 끝남 | 하루 종일 접속 유지, 개장·마감에 주문 폭주 | 모두가 같은 결과 페이지를 반복 조회 |
-| 이 서버의 역할 | 신청 페이지 제공, 신청 API 분배 | 주문·잔고 조회 API 분배 | 결과 페이지 제공, 결과 API 분배 |
-| 잘 맞는 기능 | 연결 한도 503, 타임아웃, 장애 조치 | 대기 연결이 많아도 처리량 유지, 중복 주문 없는 재시도 | 정적 파일 직접 응답, 결과 서버 분산 |
-| 보완할 점 | 대기열, 사용자별 요청 제한 | HTTPS, 실시간 시세용 WebSocket | 캐시, CDN |
-
-<details>
-<summary>구성 예시 다이어그램</summary>
-
-**수강신청**: 감당할 수 없는 요청은 503으로 빠르게 거절하고, 신청 API 서버 장애는 자동 우회.
+대규모 서비스에서 이 서버가 맡을 자리는 nginx처럼 **앞단에서 연결을 받아 뒤쪽 서버들에 나눠 주는 역할**이다. 콘서트 예매가 열리는 날 하루를 시간 순서로 따라가며, 이 서버가 버티는 장면과 부족한 장면을 상용 웹 서버(nginx 등)와 비교한다.
 
 ```mermaid
 flowchart LR
-    U["학생"] -->|HTTPS| LB["로드밸런서<br/>(TLS 처리)"]
-    LB --> W["mini-web-server<br/>정적 페이지 · /api/ 프록시"]
-    W -->|"라운드 로빈"| A1["신청 API 1"]
-    W --> A2["신청 API 2"]
-    W --> A3["신청 API 3"]
-    A1 & A2 & A3 --> D[("DB")]
+    U["관객"] -->|HTTPS| LB["로드밸런서<br/>(TLS 처리)"]
+    LB --> W["mini-web-server<br/>공연 페이지 · /api/ 프록시"]
+    W -->|"/api/reserve/"| A1["예매 API 1"]
+    W --> A2["예매 API 2"]
+    W --> A3["예매 API 3"]
+    A1 & A2 & A3 --> D[("좌석 DB")]
 ```
 
-**주식 거래**: 주문(`POST`)은 백엔드가 받기 전 실패만 재시도하므로 중복 주문이 생기지 않는다. 실시간 시세는 별도 WebSocket 서버가 담당.
+장면은 설계 예시이고, 근거는 각 기능을 확인한 테스트다. 티켓팅 규모로 부하를 걸어 측정하지는 않았다.
 
-```mermaid
-flowchart LR
-    U["투자자 앱"] -->|HTTPS| LB["로드밸런서<br/>(TLS 처리)"]
-    LB -->|"주문·조회"| W["mini-web-server"]
-    W -->|"/api/orders"| O1["주문 서버 1"]
-    W --> O2["주문 서버 2"]
-    W -->|"/api/accounts"| Q1["조회 서버"]
-    LB -->|"실시간 시세"| WS["WebSocket 서버<br/>(별도)"]
-    O1 & O2 --> M["체결 엔진"]
-```
+✅ 이 서버로 대응 · ⚠️ 일부 대응 · ❌ 기능 없음
 
-**선거 개표**: 같은 응답이 반복되므로 앞단 CDN이 대부분을 처리하고, 이 서버는 정적 페이지와 최신 결과 API를 담당.
+| 시각 | 벌어지는 일 | 이 서버 | 근거 / 상용 웹 서버의 방식 |
+|---|---|:---:|---|
+| 09:50 | 예매 페이지를 켜 둔 관객 수만 명이 오픈을 기다림 | ✅ | 대기 연결이 많아도 처리량 유지. [성능 테스트](#성능-performance): 노는 연결 9,000개에서 3.1배 |
+| 10:00 | 예매 오픈, 접속 폭주 | ✅ | 연결 한도를 넘으면 503과 `Retry-After`로 바로 거절해 서버 전체는 멈추지 않음. 통합 테스트 |
+| 10:00 | 거절된 관객이 순서와 상관없이 새로고침을 반복 | ❌ | 대기열이 없어 먼저 온 순서가 보장되지 않음. 상용: 대기열 서비스(Cloudflare Waiting Room, NetFUNNEL)가 번호표를 주고 예매 서버가 감당할 만큼만 입장시키며, 웹 서버가 입장 토큰을 검사(nginx `auth_request`) |
+| 10:01 | 매크로가 초당 수십 번 예매 요청 | ❌ | 사용자별 요청 제한 없음. 상용: nginx `limit_req`·`limit_conn`, CAPTCHA |
+| 10:01 | 헤더를 아주 천천히 보내며 연결을 붙잡는 공격 | ✅ | 헤더 마감(10초)이 지나면 408로 끊음. 통합 테스트(Slowloris) |
+| 10:02 | 예매 API 서버 1대가 죽음 | ✅ | 자동으로 제외하고 다른 서버로 재시도. [안정성 테스트](#안정성-stability): 실패 33.3% → 0% |
+| 10:02 | 예매 API 서버 1대가 응답 없이 멈춤 | ⚠️ | 감지한 뒤로는 우회(실패 0%)하지만, 감지 전에 그쪽으로 간 요청은 3초를 기다림. 상용: active 헬스체크(nginx Plus, HAProxy, AWS ALB)가 사용자보다 먼저 장애를 찾음 |
+| 10:03 | 결제 버튼을 누른 순간 예매 서버 응답이 멈춤 | ✅ | 결제(`POST`)는 이미 처리됐을 수 있으므로 다른 서버로 다시 보내지 않음 → 중복 결제 없음. 조회(`GET`)만 재시도. 통합 테스트 |
+| 10:10 | 매진, 취소표를 찾아 모두가 좌석 현황을 새로고침 | ❌ | 좌석 배치도 같은 정적 파일은 직접 응답하지만, 같은 좌석 현황 응답도 매번 예매 서버에 요청(캐시 없음). 상용: `proxy_cache`(1~2초 마이크로캐싱), CDN |
+| 10:10 | 남은 좌석을 실시간으로 알려 주고 싶음 | ❌ | WebSocket 미지원. 상용: `Upgrade` 헤더 프록시, 별도 실시간 서버 |
+| 하루 종일 | 로그인·결제 등 모든 통신은 HTTPS | ❌ | TLS 미지원이라 앞단 로드밸런서가 TLS를 처리해야 함. 상용: nginx `ssl` |
+| 다음 공연 | 더 큰 공연이라 예매 서버를 늘림 | ✅ | 설정 한 줄로 백엔드 추가(재시작 필요), CPU 코어 수만큼 이벤트 루프. [확장성](#확장성-scalability). 이 서버 자체도 여러 대 두려면 앞단 L4 로드밸런서 필요 |
 
-```mermaid
-flowchart LR
-    U["시청자"] --> CDN["CDN"]
-    CDN --> W["mini-web-server<br/>결과 페이지 · /api/results"]
-    W -->|"/api/results"| R1["결과 서버 1"]
-    W --> R2["결과 서버 2"]
-```
+**정리하면**
 
-</details>
+- **강점**: 대기 연결이 많아도 느려지지 않고, 폭주와 느린 연결 공격에도 서버 전체가 멈추지 않으며, 예매 서버 장애를 자동으로 우회하면서 결제는 중복되지 않는다.
+- **보완할 점**: 공정한 순서(대기열), 매크로 차단(요청 제한), 반복 조회(캐시), 실시간 알림(WebSocket), HTTPS는 이 서버에 없다. 실제 서비스라면 nginx나 앞단 서비스가 맡거나 기능을 추가해야 한다.
 
-## 한계와 상용 웹 서버 비교
+**그 밖의 한계**
 
-| 한계 | 영향 | 상용 웹 서버(nginx 등)의 방식 |
+| 한계 | 영향 | 상용 웹 서버의 방식 |
 |---|---|---|
-| HTTPS(TLS) 미지원 | 앞단 로드밸런서 필요 | `ssl` 모듈로 직접 TLS 처리 |
-| WebSocket·HTTP/2 미지원 | 실시간 양방향 통신 중계 불가 | `Upgrade` 헤더 프록시, HTTP/2 |
-| 캐시 없음 | 같은 응답도 매번 백엔드 요청 | `proxy_cache`(마이크로캐싱), CDN |
-| 요청 제한·대기열 없음 | 매크로·봇 차단 불가, 503 받은 사용자의 순서 보장 불가 | `limit_req`·`limit_conn`, 별도 대기열 서비스 |
-| passive 헬스체크만 지원 | 멈춘 백엔드를 처음 감지하기까지 실제 요청이 대기 | active 헬스체크(nginx Plus, HAProxy, AWS ALB) |
-| 백엔드 연결 재사용 없음 | 요청마다 연결 비용 | upstream `keepalive` |
+| 백엔드 연결 재사용 없음 | 요청마다 백엔드와 연결을 새로 맺는 비용 | upstream `keepalive` |
 | `sendfile` 미사용 | 큰 정적 파일에서 메모리 복사 | `sendfile` |
+| HTTP/2 미지원 | 연결 하나로 여러 요청을 동시에 보낼 수 없음 | HTTP/2 |
 | 설정 변경 시 재시작 | 재시작 중 연결 끊김 | `nginx -s reload` |
-| 단일 인스턴스 | 서버 자체가 단일 장애점 | 여러 인스턴스 + L4 로드밸런서 |
 
 측정 관련: 서버와 부하 도구를 같은 컴퓨터에서 실행했고, `ab`는 지연을 ms 단위로만 보고한다. Linux(epoll)에서는 같은 측정을 아직 하지 않았다.
 
@@ -396,23 +376,6 @@ flowchart LR
 | `proxy_fail_timeout_ms` | 10000 | 연결 실패나 응답 시간 초과가 난 백엔드를 건너뛰는 시간 |
 | `proxy_retry_timeout_ms` | 5000 | 응답 시간 초과 뒤 재시도를 시작할 수 있는 한도(첫 시도부터) |
 | `proxy <접두사> <주소>...` | | 접두사로 시작하는 요청을 백엔드들에 라운드 로빈으로 전달. 예: `proxy /api/ 127.0.0.1:8001 127.0.0.1:8002` |
-
-## 테스트
-
-```sh
-make test                                   # 단위 테스트 (HTTP 파싱, 정적 경로, 프록시·CGI 변환, 타이머 힙)
-make smoke smoke-dynamic smoke-concurrency  # 실제 서버를 띄운 통합 테스트
-make asan test-asan                         # AddressSanitizer
-WEBSERVER=./webserver_asan make smoke-dynamic
-make tsan                                   # ThreadSanitizer 빌드
-WEBSERVER_EVENT_BACKEND=poll make smoke smoke-dynamic smoke-concurrency   # poll 백엔드로
-```
-
-| 테스트 | 확인하는 것 |
-|---|---|
-| `smoke` | 정적 파일·MIME·20 MB 파일, 디렉토리 리다이렉트, 403·404·405·400, `..`·인코딩·심볼릭 링크를 이용한 경로 탈출 차단, `HEAD` |
-| `smoke-concurrency` | 동시 접속, keep-alive, 타임아웃, 503 한도, `SIGPIPE`, 종료, 루프 분배 |
-| `smoke-dynamic` | CGI, 내장 핸들러, 프록시 스트리밍(고정 길이·`chunked`·EOF, 20 MiB), 잘린 응답, chunked 요청 본문과 smuggling 차단, 백엔드 장애 조치(죽은·응답 없는·멈춘 백엔드, `POST` 재시도 여부, 복구) |
 
 ## 측정 재현
 
@@ -445,6 +408,36 @@ for e in idle workers failover; do python3 bench/plot.py bench/results/linux-$e.
 - `bench.py`의 `--series 이름=실행파일:백엔드`에서 백엔드를 비우면 서버 기본값(기존 코드는 `poll`).
 - 측정 중에는 다른 무거운 프로그램을 끄고, 측정을 동시에 두 개 돌리지 않는다(포트 변경은 `BENCH_PORT`).
 - 숫자 자체보다 추세를 비교한다: 노는 연결이 늘 때 개선 전과 `poll`은 떨어지고 epoll은 유지되는지.
+
+## 테스트
+
+단위 테스트는 함수 단위로, 통합 테스트는 실제 서버와 테스트용 백엔드·CGI를 띄워 요청을 보내 확인한다.
+
+| 확인하는 것 | 주요 검사 항목 | 테스트 |
+|---|---|---|
+| HTTP 요청 해석 | 요청 줄·헤더 파싱, 잘못된 요청(형식 오류, NUL, 헤더 수 초과), `Content-Length` 검증, keep-alive 판정, 파이프라이닝된 요청 분리 | 단위 `test_http`, 통합 `smoke-concurrency` |
+| 요청 본문과 smuggling 방지 | `chunked` 요청 본문(잘게 나눈 전송, 300 KB, 빈 본문), `Transfer-Encoding`·`Content-Length` 충돌 400, 지원하지 않는 코딩 501, 잘못된 청크 400, 1 MiB 초과 413, smuggling 시도에 응답이 하나만 나가는지 | 단위 `test_http`, 통합 `smoke-dynamic` |
+| 정적 파일 | 경로 정규화와 퍼센트 디코딩, MIME, 20 MB 파일 바이트 일치, `HEAD`, 디렉토리 301·403, 404·405·400 | 단위 `test_static`, 통합 `smoke` |
+| 경로 탈출 차단 | `../`, `%2e%2e`, 심볼릭 링크로 문서 루트 밖에 접근하면 403, 비밀 파일 내용이 새지 않는지 | 단위 `test_static`, 통합 `smoke` |
+| CGI·내장 핸들러 | CGI 환경변수 10종, stdin 본문 전달, 500 KB 왕복(파이프 교착 없음), `Status`·`Location` 헤더, 실패 시 502·403·404·405, 타임아웃 504와 손자 프로세스 종료, 40개 동시 실행, 좀비 프로세스 없음 | 단위 `test_dynamic`, 통합 `smoke-dynamic` |
+| 리버스 프록시 중계 | 요청 재작성(`Host`, `X-Forwarded-*`, hop-by-hop 헤더 제거), 백엔드가 다 보내기 전에 응답 시작, 20 MiB 응답 일치, 고정 길이·`chunked`·EOF 경계, 잘린 응답 처리, `HEAD`, 클라이언트 keep-alive 유지 | 단위 `test_dynamic`, 통합 `smoke-dynamic` |
+| 부하 분산과 장애 조치 | 라운드 로빈 분배, 죽은·응답 없는·멈춘 백엔드 우회와 재시도, `POST`는 응답 시간 초과 때 재시도하지 않음, 10초 뒤 복구, 모든 백엔드가 죽으면 502 | 단위 `test_dynamic`, 통합 `smoke-dynamic` |
+| 동시성과 이벤트 루프 | 동시 요청 50·400개, 느린 클라이언트나 큰 다운로드가 다른 요청을 막지 않음, 노는 연결 1,000개 중 새 요청 즉시 응답, 루프 4개에 연결 고르게 분배, 타이머 힙 순서(무작위 2만 번) | 단위 `test_timer`, 통합 `smoke-concurrency` |
+| 타임아웃과 자원 한도 | 유휴 연결 종료, Slowloris 408, 설정한 헤더·본문 마감, 연결 한도 초과 시 503과 `Retry-After` | 통합 `smoke-concurrency`, `smoke-dynamic` |
+| 오류 격리와 종료 | 클라이언트가 중간에 끊어도 서버 생존(`SIGPIPE`), `SIGINT`·`SIGTERM` 시 진행 중인 20 MB 다운로드를 끝낸 뒤 종료, 새 연결 거절, 두 번 누르면 강제 종료 | 통합 `smoke-concurrency` |
+| 메모리·스레드 안전성 | 메모리 오류(AddressSanitizer), 스레드 간 데이터 경쟁(ThreadSanitizer) | `make test-asan`, ASan·TSan 서버로 통합 테스트 |
+
+**결과** (2026-11-26, macOS): 단위 테스트 261개(`test_http` 85, `test_static` 48, `test_dynamic` 115, `test_timer` 13)와 통합 테스트 155개(`smoke` 32, `smoke-concurrency` 33, `smoke-dynamic` 90) 검사 항목이 모두 통과했다. 통합 테스트는 kqueue와 `poll` 백엔드 양쪽에서 통과했고, ASan(단위·`smoke-dynamic`·`smoke-concurrency`)과 TSan(`smoke-concurrency`)에서 보고가 없었다. Linux(epoll)에서는 아직 실행하지 않았다.
+
+```sh
+make test                                   # 단위 테스트
+make smoke smoke-dynamic smoke-concurrency  # 통합 테스트
+make asan test-asan                         # AddressSanitizer 빌드와 단위 테스트
+WEBSERVER=./webserver_asan make smoke-dynamic smoke-concurrency
+make tsan                                   # ThreadSanitizer 빌드
+WEBSERVER=./webserver_tsan make smoke-concurrency
+WEBSERVER_EVENT_BACKEND=poll make smoke smoke-dynamic smoke-concurrency   # poll 백엔드로
+```
 
 ## 팀 PR 통합 기록
 
