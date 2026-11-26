@@ -12,21 +12,7 @@ C와 POSIX API로 만든 HTTP/1.1 웹 서버. 정적 파일, CGI, 내장 핸들�
 
 정글 13기 13주차 13팀 프로젝트.
 
-**목차** · [빠른 시작](#빠른-시작) · [내부 구조](#내부-구조) · [성능](#성능-performance) · [안정성](#안정성-stability) · [확장성](#확장성-scalability) · [티켓팅 날로 보는 강점과 한계](#실제-서비스에-적용한다면-콘서트-티켓팅-날) · [설정](#설정) · [테스트](#테스트) · [측정 재현](#측정-재현) · [팀 PR 통합 기록](#팀-pr-통합-기록)
-
-## 빠른 시작
-
-```sh
-make
-make run                            # http://localhost:18080/
-```
-
-| 기능 | 확인 방법 |
-|---|---|
-| 정적 파일 | `/`, `/docs/` |
-| CGI · 내장 핸들러 | `/cgi-bin/add?a=1&b=2`, `/builtin/add?a=1&b=2`, `/form.html` |
-| 리버스 프록시 | 터미널 두 개에서 `make backends`, `make run-proxy` → `curl http://localhost:18080/api/hello` 반복 시 백엔드 3대가 번갈아 응답 |
-| 장애 조치 | 위 상태에서 백엔드 하나를 종료 → 남은 백엔드만 응답 |
+**목차** · [내부 구조](#내부-구조) · [성능](#성능-performance) · [안정성](#안정성-stability) · [확장성](#확장성-scalability) · [티켓팅 날로 보는 강점과 한계](#실제-서비스에-적용한다면-콘서트-티켓팅-날) · [설정](#설정) · [테스트](#테스트) · [측정 재현](#측정-재현) · [빠른 시작](#빠른-시작) · [팀 PR 통합 기록](#팀-pr-통합-기록)
 
 ## 내부 구조
 
@@ -51,6 +37,8 @@ flowchart LR
 - 요청은 **프록시 규칙 → `/cgi-bin/` → `/builtin/` → 정적 파일** 순서로 처리한다.
 - 프록시는 라운드 로빈으로 백엔드를 고르고, 실패한 백엔드는 잠시 건너뛰며, 응답은 받는 대로 스트리밍한다.
 
+<br/>
+
 연결 유지는 구간마다 다르다.
 
 ```text
@@ -58,82 +46,13 @@ flowchart LR
            (연결 하나로 최대 100개 요청)                    (HTTP/1.1 + Connection: close)
 ```
 
-백엔드와 HTTP/1.1을 쓰는 이유는 연결 유지가 아니라 `chunked` 응답을 받는 대로 중계하기 위해서다. 백엔드 연결 재사용은 아직 없다.
 
-<details>
-<summary>멀티 이벤트 루프</summary>
-
-```text
-[메인 스레드 = acceptor]                  [이벤트 루프 스레드 x N]
-poll(listen, stop)                        poller_wait([wake, stop, 자식회수, 자기 연결들...])
-  accept → 전체 연결 수 >= 한도면 503         wake: inbox 의 연결을 꺼내 conn_new
-         → 연결이 가장 적은 루프의    ──▶    이벤트가 온 연결만 conn_handle
-           inbox 에 넣고 wake 파이프에 1바이트  마감 지난 연결만 conn_timeout, 끝난 연결 정리
-  stop  → listen 닫기, 루프 join
-```
-
-- 연결은 처음 맡은 루프에서 끝까지 처리하므로 `conn.c`의 상태 머신에 잠금이 필요 없다.
-- 스레드끼리 공유하는 값(연결 수, 통계, 라운드 로빈 카운터, 백엔드 down 시각)은 atomic, CGI 고아 목록과 루프 inbox는 mutex로 보호한다.
-- 시그널은 메인 스레드만 받고, 파이프로 루프들에 종료와 CGI 자식 종료를 알린다.
-- fd를 만든 뒤 `FD_CLOEXEC`를 켜기 전에 다른 스레드가 `fork`하면 fd가 CGI 자식에게 새므로, `accept`, 백엔드 `socket`, CGI `pipe`+`fork`는 같은 잠금(`cgi_fd_guard`) 안에서 한다.
-
-</details>
-
-<details>
-<summary>이벤트 백엔드(poller)와 타이머 힙</summary>
-
-| 백엔드 | OS | 대기 비용 |
-|---|---|---|
-| `poll` | 모두 | 등록된 fd 전체를 매번 커널에 넘기고 훑음: O(등록된 fd 수) |
-| `epoll` | Linux | 커널이 등록을 들고 있고 준비된 fd만 돌려줌: O(준비된 fd 수) |
-| `kqueue` | macOS, BSD | epoll과 같음 |
-
-- 루프는 연결을 poller에 등록해 두고, 연결을 건드린 직후(`conn_new`, `conn_handle`, `conn_timeout`, `conn_shutdown`)에만 `watch_touched`에서 감시 fd·마감·종료 여부를 맞춘다. 한 바퀴의 일은 열린 연결 수가 아니라 일이 생긴 연결 수에 비례한다.
-- `conn.c`는 감시 중인 fd를 닫기 직전에 훅(`conn_set_close_hook`)을 불러 등록을 먼저 지운다. 같은 번호로 새 fd를 열 때(프록시 재시도) 등록이 빠지거나, epoll에서 `fork`된 자식 때문에 등록이 남는 문제를 막는다.
-- kqueue는 읽기·쓰기를 따로 알려 주고(루프가 합침), 기다리는 이벤트가 없는 fd의 끊김은 알려 주지 않는다. macOS에서는 `poll`도 같아 동작 차이는 없었다.
-
-</details>
-
-<details>
-<summary>백엔드 장애 조치</summary>
-
-| 상황 | 처리 |
-|---|---|
-| 연결 거부, 도달 불가, 연결 시간 초과 | 그 백엔드를 `proxy_fail_timeout_ms` 동안 down으로 표시하고 다음 백엔드로 재시도. 요청을 보내기 전이라 `POST`도 재시도 |
-| 연결 후 응답 시간 초과 | down으로 표시. `GET`·`HEAD`이고 응답을 보내기 전이며 `proxy_retry_timeout_ms` 안이면 재시도, 아니면 504. `POST`는 이미 처리됐을 수 있어 재시도하지 않음 |
-| 연결 후 응답이 망가지거나 끊김 | 재시도하지 않고 502 |
-| down인 백엔드 | 라운드 로빈에서 건너뜀. 시간이 지나면 다시 후보가 됨 |
-| 살아 있는 백엔드 없음 | down인 백엔드라도 한 번씩 시도. 모두 실패하면 502(연결 시간 초과면 504) |
-
-</details>
-
-<details>
-<summary>프록시 응답과 요청 본문의 경계</summary>
-
-| 백엔드 응답 | 완료 조건 |
-|---|---|
-| `Content-Length` | 선언된 바이트 수를 전달하면 완료 |
-| `Transfer-Encoding: chunked` | 마지막 0 청크까지. HTTP/1.1 클라이언트에는 청크를 다시 만들고, HTTP/1.0 클라이언트에는 디코딩해 보낸 뒤 연결을 닫음 |
-| 길이 헤더 없음 | 백엔드 EOF까지 중계한 뒤 연결을 닫음 |
-| `HEAD`, 204, 304 | 헤더만 전송 |
-
-요청 본문은 `http_body_framing`이 같은 규칙으로 끝을 정한다. 본문 경계가 모호하면 request smuggling이 생기므로 거절한다.
-
-| 요청 헤더 | 처리 |
-|---|---|
-| `Content-Length` | 선언된 바이트 수만큼 읽음 |
-| `Transfer-Encoding: chunked` | 마지막 0 청크까지 읽어 CGI·백엔드에 `Content-Length`로 전달 |
-| TE와 CL이 함께 있음, HTTP/1.0의 TE, `chunked`가 마지막이 아니거나 중복 | 400 |
-| 지원하지 않는 코딩(`gzip, chunked` 등) | 501 |
-| 잘못된 청크, 1 MiB 초과 | 400, 413 |
-
-[RFC 9112 §6.3 및 §7.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3) 참고.
-
-</details>
-
+- 백엔드와 HTTP/1.1을 쓰는 이유는 연결 유지가 아니라 `chunked` 응답을 받는 대로 중계하기 위해서다. 백엔드 연결 재사용은 아직 없다.
 ---
 
 아래 세 절은 **정의 → 구현한 기능 → 대표 테스트** 순서다. 기능 상태는 ✅ 구현 · ⚠️ 일부 · ❌ 미구현. 측정은 Apple M5(10코어) MacBook, macOS에서 서버와 부하 도구(`ab`)를 같은 컴퓨터에 두고 했다.
+
+<br/>
 
 ## 성능 (Performance)
 
@@ -183,6 +102,8 @@ poll(listen, stop)                        poller_wait([wake, stop, 자식회수,
 - 가장 무거운 ②③을 바꾼 kqueue만 노는 연결 수와 상관없이 처리량을 유지했다.
 - 루프만 개선한 효과는 약 4%다. 루프 개선은 kqueue·epoll의 효과가 나도록 루프 쪽 전체 순회를 없앤 기반 작업이다.
 
+<br/>
+
 ## 안정성 (Stability)
 
 > **안정성이란** 일부 구성 요소가 고장 나거나 예상 밖의 입력과 부하가 와도 서비스가 계속 동작하는가. 실패한 요청의 비율, 감지와 회복에 걸리는 시간으로 본다.
@@ -221,6 +142,8 @@ poll(listen, stop)                        poller_wait([wake, stop, 자식회수,
 - 장애 백엔드는 제외되고 남은 2대가 나눠 처리했다. 재시작한 백엔드는 10초 뒤 다시 분배 대상이 된다.
 - "1대 멈춤"에서 10건은 3초 기다린 뒤 성공했다. 멈춘 백엔드를 처음 감지하기 전에 그쪽으로 간 요청이다.
 
+<br/>
+
 ## 확장성 (Scalability)
 
 > **확장성이란** 자원을 늘렸을 때 처리량도 그만큼 늘어나는가. 성능이 "지금 얼마나 처리하나"라면 확장성은 "늘리면 얼마나 더 처리하나"다. 코어를 늘리는 수직 확장과 서버 대수를 늘리는 수평 확장이 있다.
@@ -253,6 +176,10 @@ poll(listen, stop)                        poller_wait([wake, stop, 자식회수,
 - 루프 2개에서 약 1.6배(이상적인 2배의 약 80%). 4개, 8개에서는 오히려 줄었다.
 - 서버와 `ab` 4개가 같은 컴퓨터의 코어를 나눠 써서 부하 도구가 먼저 한계에 닿았을 가능성이 크지만, 서버 쪽 원인과 구분하지 못했다.
 - 제대로 재려면 부하 도구를 다른 컴퓨터에서 실행하고 서버와 부하 도구의 CPU 사용률을 함께 기록해야 한다.
+
+---
+
+<br/>
 
 ## 실제 서비스에 적용한다면: 콘서트 티켓팅 날
 
@@ -411,6 +338,20 @@ for e in idle workers failover; do python3 bench/plot.py bench/results/linux-$e.
 - 노는 연결은 RST로 끊어 TIME_WAIT로 포트가 고갈되지 않게 한다. macOS는 임시 포트가 약 16,000개라 9,000개까지 측정했다.
 
 </details>
+
+## 빠른 시작
+
+```sh
+make
+make run                            # http://localhost:18080/
+```
+
+| 기능 | 확인 방법 |
+|---|---|
+| 정적 파일 | `/`, `/docs/` |
+| CGI · 내장 핸들러 | `/cgi-bin/add?a=1&b=2`, `/builtin/add?a=1&b=2`, `/form.html` |
+| 리버스 프록시 | 터미널 두 개에서 `make backends`, `make run-proxy` → `curl http://localhost:18080/api/hello` 반복 시 백엔드 3대가 번갈아 응답 |
+| 장애 조치 | 위 상태에서 백엔드 하나를 종료 → 남은 백엔드만 응답 |
 
 ## 팀 PR 통합 기록
 
