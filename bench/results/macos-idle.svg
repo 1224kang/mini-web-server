@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="860" height="500" viewBox="0 0 860 500" font-family="-apple-system, 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif">
 <rect width="860" height="500" fill="#fcfcfb"/>
-<text x="84" y="38" font-size="20" font-weight="600" fill="#0b0b0b">노는 연결이 늘어도 처리량이 유지되는가</text>
-<text x="84" y="62" font-size="13" fill="#52514e">루프 1개, 활성 연결 50개로 측정 · 다른 연결 수천 개가 keep-alive로 대기 중</text>
+<text x="84" y="38" font-size="20" font-weight="600" fill="#0b0b0b">접속만 해 둔 사용자가 늘어도 처리량이 유지되는가</text>
+<text x="84" y="62" font-size="13" fill="#52514e">루프 1개 · 요청을 보내는 연결 50개로 측정 · 대기 연결 = 접속만 해 두고 요청을 보내지 않는 연결</text>
 <line x1="84" y1="430.0" x2="610" y2="430.0" stroke="#e4e3df" stroke-width="1"/>
 <text x="74" y="434.0" font-size="12" fill="#52514e" text-anchor="end">0</text>
 <line x1="84" y1="346.5" x2="610" y2="346.5" stroke="#e4e3df" stroke-width="1"/>
@@ -18,7 +18,7 @@
 <text x="230.1" y="452" font-size="12" fill="#52514e" text-anchor="middle">2,500</text>
 <text x="376.2" y="452" font-size="12" fill="#52514e" text-anchor="middle">5,000</text>
 <text x="610.0" y="452" font-size="12" fill="#52514e" text-anchor="middle">9,000</text>
-<text x="347.0" y="482" font-size="12" fill="#52514e" text-anchor="middle">대기 중인(노는) 연결 수</text>
+<text x="347.0" y="482" font-size="12" fill="#52514e" text-anchor="middle">대기 연결 수 (접속만 해 둔 사용자)</text>
 <polyline points="84.0,147.9 142.4,184.3 230.1,249.4 376.2,293.4 610.0,339.6" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="84.0" cy="147.9" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
 <circle cx="142.4" cy="184.3" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>

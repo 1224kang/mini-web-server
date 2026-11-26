@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="860" height="500" viewBox="0 0 860 500" font-family="-apple-system, 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif">
 <rect width="860" height="500" fill="#fcfcfb"/>
 <text x="84" y="38" font-size="20" font-weight="600" fill="#0b0b0b">이벤트 루프를 늘리면 처리량이 느는가</text>
-<text x="84" y="62" font-size="13" fill="#52514e">노는 연결 없음 · ab 4개 × 동시 연결 50개 · 서버와 부하 도구가 같은 컴퓨터</text>
+<text x="84" y="62" font-size="13" fill="#52514e">대기 연결 없음 · ab 4개 × 동시 연결 50개 · 서버와 부하 도구가 같은 컴퓨터</text>
 <line x1="84" y1="430.0" x2="610" y2="430.0" stroke="#e4e3df" stroke-width="1"/>
 <text x="74" y="434.0" font-size="12" fill="#52514e" text-anchor="end">0</text>
 <line x1="84" y1="346.5" x2="610" y2="346.5" stroke="#e4e3df" stroke-width="1"/>

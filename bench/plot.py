@@ -4,7 +4,7 @@
     python3 bench/plot.py bench/results/macos-idle.csv    bench/results/macos-idle.svg
     python3 bench/plot.py bench/results/macos-workers.csv bench/results/macos-workers.svg
 
-idle CSV 는 x = 노는 연결 수, workers CSV 는 x = 이벤트 루프 수. y 는 초당 처리 요청 수.
+idle CSV 는 x = 대기 연결(접속만 해 둔 사용자) 수, workers CSV 는 x = 이벤트 루프 수. y 는 초당 처리 요청 수.
 failover.py 의 CSV(phase 열이 있음)는 단계별 실패 비율 막대그래프로 그린다.
 """
 import csv
@@ -136,12 +136,12 @@ def main():
         return top + ph * (1 - y / ymax)
 
     if kind == "idle":
-        title = "노는 연결이 늘어도 처리량이 유지되는가"
-        sub = "루프 1개, 활성 연결 50개로 측정 · 다른 연결 수천 개가 keep-alive로 대기 중"
-        xlabel = "대기 중인(노는) 연결 수"
+        title = "접속만 해 둔 사용자가 늘어도 처리량이 유지되는가"
+        sub = "루프 1개 · 요청을 보내는 연결 50개로 측정 · 대기 연결 = 접속만 해 두고 요청을 보내지 않는 연결"
+        xlabel = "대기 연결 수 (접속만 해 둔 사용자)"
     else:
         title = "이벤트 루프를 늘리면 처리량이 느는가"
-        sub = "노는 연결 없음 · ab 4개 × 동시 연결 50개 · 서버와 부하 도구가 같은 컴퓨터"
+        sub = "대기 연결 없음 · ab 4개 × 동시 연결 50개 · 서버와 부하 도구가 같은 컴퓨터"
         xlabel = "이벤트 루프 스레드 수 (workers)"
 
     o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
