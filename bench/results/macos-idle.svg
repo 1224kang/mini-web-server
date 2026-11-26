@@ -38,12 +38,12 @@
 <path d="M376.2,143.3 L382.1,149.2 L376.2,155.0 L370.4,149.2Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
 <path d="M610.0,145.8 L615.9,151.7 L610.0,157.5 L604.1,151.7Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
 <path d="M624.0,141.8 L629.9,147.7 L624.0,153.5 L618.1,147.7Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
-<text x="636" y="151.7" font-size="13" font-weight="600" fill="#0b0b0b">새 루프 + kqueue</text>
+<text x="636" y="151.7" font-size="13" font-weight="600" fill="#0b0b0b">루프 개선 + kqueue</text>
 <text x="636" y="167.7" font-size="12" fill="#52514e">41,667 req/s</text>
 <rect x="619.5" y="327.1" width="9.0" height="9.0" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
-<text x="636" y="335.6" font-size="13" font-weight="600" fill="#0b0b0b">새 루프 + poll</text>
+<text x="636" y="335.6" font-size="13" font-weight="600" fill="#0b0b0b">루프만 개선 (poll)</text>
 <text x="636" y="351.6" font-size="12" fill="#52514e">14,135 req/s</text>
 <circle cx="624.0" cy="365.6" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
-<text x="636" y="369.6" font-size="13" font-weight="600" fill="#0b0b0b">기존 서버</text>
+<text x="636" y="369.6" font-size="13" font-weight="600" fill="#0b0b0b">개선 전</text>
 <text x="636" y="385.6" font-size="12" fill="#52514e">13,536 req/s</text>
 </svg>

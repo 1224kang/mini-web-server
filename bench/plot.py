@@ -16,8 +16,8 @@ from html import escape
 STYLE = {"before": ("#2a78d6", "circle"), "poll": ("#eb6834", "square"),
          "kqueue": ("#1baf7a", "diamond"), "epoll": ("#eda100", "triangle")}
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
-LABELS = {"before": "기존 서버", "poll": "새 루프 + poll",
-          "kqueue": "새 루프 + kqueue", "epoll": "새 루프 + epoll"}
+LABELS = {"before": "개선 전", "poll": "루프만 개선 (poll)",
+          "kqueue": "루프 개선 + kqueue", "epoll": "루프 개선 + epoll"}
 
 
 def nice_max(v):
